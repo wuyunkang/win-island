@@ -6,7 +6,10 @@ use crate::theme::{self, size, W};
 use eframe::egui::{self, Color32, Rect};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum AlertSource { Internal, Wechat, Dingtalk, Activity(String), External(String) }
+pub(crate) enum AlertSource {
+    Internal, Wechat, Dingtalk, Activity(String), External(String),
+    Agent { source: crate::agent_sessions::Source, path: std::path::PathBuf, turn_id: String, state: crate::agent_sessions::AgentState },
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Alert {
@@ -93,6 +96,9 @@ pub(crate) fn messenger_icon(c:&Card,x:f32,y:f32,source:crate::app::Messenger){
     }
 }
 fn notice_icon(c:&Card,x:f32,y:f32,a:&Alert) {
+    if let AlertSource::Agent { source,state,.. }=&a.source {
+        crate::ai_ui::draw_agent_symbol(c,*source,*state,x,y,0.0);return;
+    }
     if a.source!=AlertSource::Internal{crate::paint::bell(c,x,y,theme::WHITE,0.0);return;}
     match a.title.as_str() {
         "系统音量"=>{
@@ -336,6 +342,21 @@ impl App {
         self.enqueue_alert(Alert{source:AlertSource::External(id),title,body,page:usize::MAX,at:self.t,duration:4.5,bluetooth:None,meeting:None},false);
     }
     pub(crate) fn tick_alerts(&mut self) {
+        for task in self.ai.take_notifications() {
+            if !self.settings.notifications || !self.ai.config.notifications_enabled(task.source) || self.ai.notification_read(&task) {continue;}
+            self.pending_agents.retain(|s|s.source!=task.source||s.path!=task.path);
+            self.pending_agents.push(task.summary());
+            if self.pending_agents.len()>32 {self.pending_agents.remove(0);}
+            let status=if task.state==crate::agent_sessions::AgentState::Completed {"任务完成"}else{"需要确认"};
+            let project=if task.project.is_empty(){"Agent 会话"}else{&task.project};
+            self.notification_bell_at=self.t;self.notification_bell_until=self.t+4.5;
+            self.enqueue_alert(Alert {
+                title:format!("{} · {status}",task.source.label()),
+                body:format!("{project} · 请到 {} 查看",task.source.label()),
+                source:AlertSource::Agent {source:task.source,path:task.path,turn_id:task.turn_id,state:task.state},
+                page:6,at:self.t,duration:4.5,bluetooth:None,meeting:None,
+            },false);
+        }
         let old_activity_at=self.notice.as_ref().and_then(|a|if let AlertSource::Activity(id)=&a.source{Some((id.clone(),a.at))}else{None});
         if old_activity_at.is_some(){self.notice=None;}
         let activity=if self.settings.live_api && self.settings.notifications {
@@ -346,16 +367,25 @@ impl App {
             crate::app::Messenger::Dingtalk=>self.settings.dingtalk_notifications,
             crate::app::Messenger::Qq=>self.settings.read_notifications && self.notification_apps.items.iter().any(|(key,_,on)|key=="QQ" && *on),
         });
+        for notice in &mut self.pending_agents {self.ai.observe_notification_unread(notice);}
+        self.pending_agents.retain(|s|self.settings.notifications && self.ai.config.notifications_enabled(s.source)
+            && !self.ai.notification_read(s)
+            && (s.state==crate::agent_sessions::AgentState::Completed || self.ai.notification_current(s.source,&s.path,&s.turn_id,s.state)));
         let allowed=|a:&Alert|match &a.source {
             AlertSource::Internal=>true,
             AlertSource::Wechat=>self.settings.wechat_notifications && self.settings.notifications,
             AlertSource::Dingtalk=>self.settings.dingtalk_notifications && self.settings.notifications,
+            AlertSource::Agent {source,path,turn_id,state}=>self.settings.notifications && self.ai.config.notifications_enabled(*source) && self.ai.notification_current(*source,path,turn_id,*state)
+                && self.pending_agents.iter().any(|s|s.source==*source&&s.path==*path&&s.turn_id==*turn_id),
             AlertSource::Activity(id)=>self.settings.live_api && self.settings.notifications && self.activities.lock().ok().is_some_and(|store|store.get(id).is_some()),
             AlertSource::External(id) if id=="DingTalk"=>self.settings.dingtalk_notifications && self.settings.read_notifications && !self.settings.qq_only && self.settings.notifications && self.notification_apps.items.iter().any(|(key,_,on)|key==id && *on),
             AlertSource::External(id)=>self.settings.read_notifications && (!self.settings.qq_only || id=="QQ") && self.settings.notifications && self.notification_apps.items.iter().any(|(key,_,on)|key==id && *on),
         };
         self.alerts.retain(&allowed);
-        if self.notice.as_ref().is_some_and(|a|!allowed(a)){self.notice=None;}
+        if self.notice.as_ref().is_some_and(|a|!allowed(a)){
+            if self.notice.as_ref().is_some_and(|a|matches!(a.source,AlertSource::Agent {..})) {self.notification_bell_until=0.;}
+            self.notice=None;
+        }
         if self.hud_notice.as_ref().is_some_and(|a|!allowed(a)){self.hud_notice=None;}
         if !self.settings.notification_preview {
             for a in self.alerts.iter_mut().chain(self.notice.iter_mut()).chain(self.hud_notice.iter_mut()) {
@@ -409,6 +439,19 @@ impl App {
             nc.centered_text(44.0,30.0,&nc.fit(&a.body,10.5,W::Regular,154.0),10.5,W::Regular,theme::GRAY,H::Left);
             if notice_button(&nc,206.0,12.0,52.0,"查看","messenger-view"){_cmds.push(Cmd::ViewMessenger(self.latest_unread(source)));}
             if notice_button(&nc,265.0,12.0,52.0,"关闭","messenger-dismiss"){self.notice=None;self.notification_bell_until=0.0;}
+            return;
+        }
+        if let AlertSource::Agent {source,path,state,..}=&a.source {
+            crate::ai_ui::draw_agent_symbol(&nc,*source,*state,22.0,22.0,self.t);
+            nc.circle(31.0,14.0,2.6,Color32::from_rgb(255,72,72));
+            nc.centered_text(44.0,14.0,&nc.fit(&a.title,11.0,W::Semibold,154.0),11.0,W::Semibold,theme::WHITE,H::Left);
+            nc.centered_text(44.0,30.0,&nc.fit(&a.body,10.5,W::Regular,154.0),10.5,W::Regular,theme::GRAY,H::Left);
+            if notice_button(&nc,206.0,12.0,52.0,"查看","agent-view") {
+                _cmds.push(Cmd::AgentReturn(*source));self.viewed_agent(*source,path);
+            }
+            if notice_button(&nc,265.0,12.0,52.0,"关闭","agent-dismiss") {
+                self.notice=None;self.notification_bell_until=0.0;
+            }
             return;
         }
         if a.source!=AlertSource::Internal {
@@ -518,6 +561,12 @@ impl App {
                 }
             }
         }
+    }
+    pub(crate) fn viewed_agent(&mut self, source:crate::agent_sessions::Source, path:&std::path::Path) {
+        self.pending_agents.retain(|s|s.source!=source||s.path!=path);
+        let same=|a:&Alert|matches!(&a.source,AlertSource::Agent {source:previous,path:previous_path,..} if *previous==source&&previous_path==path);
+        self.alerts.retain(|a|!same(a));
+        if self.notice.as_ref().is_some_and(same) {self.notice=None;self.notification_bell_until=0.;}
     }
     /// v0.5.4：可交互音量条。样式参考 oyenza-studio（MIT）的 HUD 音量条：
     /// 圆角胶囊、填充缓动、拖动时加粗并出现手柄；拖动/滚轮改音量，点喇叭静音。
@@ -910,8 +959,19 @@ fn switch(ui:&mut egui::Ui,value:&mut bool)->bool { switch_widget(ui,value,None)
 fn feature_switch(ui:&mut egui::Ui,page:usize,mode:&str,value:&mut bool)->bool {
     switch_widget(ui,value,Some(egui::Id::new(("feature-switch",page,mode))))
 }
+pub(crate) fn monitor_switch(ui:&mut egui::Ui,reading:usize,mode:&str,value:&mut bool)->bool {
+    switch_widget(ui,value,Some(egui::Id::new(("monitor-switch",reading,mode))))
+}
 pub(crate) fn agent_capsule_switch(ui:&mut egui::Ui,value:&mut bool)->bool {
     switch_widget(ui,value,Some(egui::Id::new("agent-capsule-switch")))
+}
+pub(crate) fn agent_source_switch(ui:&mut egui::Ui,source:crate::agent_sessions::Source,mode:&str,value:&mut bool)->bool {
+    switch_widget(ui,value,Some(egui::Id::new(("agent-source-switch",source.label(),mode))))
+}
+pub(crate) fn agent_source_row(ui:&mut egui::Ui,title:&str,source:crate::agent_sessions::Source,mode:&str,value:&mut bool) {
+    settings_control_row(ui,title,130.,|ui|ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
+        agent_source_switch(ui,source,mode,value);
+    }).response);
 }
 fn switch_widget(ui:&mut egui::Ui,value:&mut bool,id:Option<egui::Id>)->bool {
     let (rect,response)=ui.allocate_exact_size(egui::vec2(34.0,20.0),if id.is_some(){egui::Sense::hover()}else{egui::Sense::click()});
@@ -1088,7 +1148,7 @@ fn settings_description(tab:usize)->&'static str {
         0=>"启动、交互和设置窗口的外观。",
         3=>"调整岛体形状、皮肤、大小与停靠位置。",
         10=>"排列常驻组件，选择胶囊和展开时显示的功能。",
-        13=>"查看性能趋势，为不同读数选择颜色。",
+        13=>"选择监控项目，分别设置胶囊和展开显示，实时预览配色。",
         14=>"以缩略图选择主题，实时查看背景、文字和强调色。",
         6=>"管理系统提示、聊天通知和正文隐私。",
         9=>"版本、更新与第三方声明。",

@@ -40,7 +40,7 @@ fn main() {
         let directory=PathBuf::from(env::var("OUT_DIR").unwrap());
         // MinGW 没有自带 Windows 系统 winsqlite3 的导入库；只声明上游用到的四个系统符号。
         let definitions=directory.join("winsqlite3.def");
-        fs::write(&definitions,"LIBRARY winsqlite3.dll\nEXPORTS\nsqlite3_open_v2\nsqlite3_exec\nsqlite3_close\n").unwrap();
+        fs::write(&definitions,"LIBRARY winsqlite3.dll\nEXPORTS\nsqlite3_open_v2\nsqlite3_exec\nsqlite3_busy_timeout\nsqlite3_close\n").unwrap();
         let imported=directory.join("libwinsqlite3.a");
         assert!(Command::new("llvm-dlltool").args(["-m","i386:x86-64","-d"]).arg(&definitions).arg("-l").arg(&imported).status().is_ok_and(|status|status.success()),"无法生成 Windows SQLite 导入库");
         println!("cargo:rustc-link-search=native={}",directory.display());

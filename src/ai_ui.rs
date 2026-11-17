@@ -11,6 +11,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+const AGENT_ICON_WIDTH: f32 = 27.;
+const AGENT_SOURCE_GAP: f32 = 8.;
+const AGENT_PROJECT_INSET: f32 = 31.;
+const AGENT_PROJECT_PADDING: f32 = AGENT_PROJECT_INSET + 4.;
+
 struct Block {
     kind: MessageKind,
     top: f32,
@@ -22,14 +27,14 @@ struct Body {
     height: f32,
 }
 struct Finished {
-    source: Source,
-    id: String,
-    turn_id: String,
+    snapshot: Snapshot,
     until: f64,
 }
 impl Finished {
     fn matches(&self, s: &Snapshot) -> bool {
-        self.source == s.source && self.id == s.id && self.turn_id == s.turn_id
+        self.snapshot.source == s.source
+            && self.snapshot.id == s.id
+            && self.snapshot.turn_id == s.turn_id
     }
 }
 pub(crate) struct State {
@@ -42,6 +47,9 @@ pub(crate) struct State {
     service: Option<agent::Service>,
     hold: Option<std::path::PathBuf>,
     finished: Vec<Finished>,
+    notifications: Vec<Snapshot>,
+    waiting_notices: Vec<(Source, String, String)>,
+    read_receipts: Vec<agent::SessionReadReceipt>,
     observing: bool,
     body: Body,
     scroll: f32,
@@ -66,6 +74,9 @@ impl Default for State {
             service: None,
             hold: None,
             finished: Vec::new(),
+            notifications: Vec::new(),
+            waiting_notices: Vec::new(),
+            read_receipts: Vec::new(),
             observing: false,
             body: Body::default(),
             scroll: 0.,
@@ -97,6 +108,19 @@ impl State {
     fn sessions(&self) -> impl Iterator<Item = &Snapshot> {
         self.recent.iter().chain(self.snapshot.iter())
     }
+    fn capsule_candidates(&self, t: f64) -> impl Iterator<Item = &Snapshot> {
+        self.sessions().chain(
+            self.finished
+                .iter()
+                .filter(move |f| f.until > t)
+                .map(|f| &f.snapshot),
+        )
+    }
+    fn capsule_session_visible(&self, s: &Snapshot, t: f64) -> bool {
+        !s.subagent
+            && (display_state(s).active()
+                || self.finished.iter().any(|f| f.until > t && f.matches(s)))
+    }
     fn capsule_sessions(&self, t: f64) -> Vec<&Snapshot> {
         [Source::Codex, Source::Dsh]
             .into_iter()
@@ -104,22 +128,54 @@ impl State {
                 if !self.config.source_enabled(source) {
                     return None;
                 }
-                self.sessions()
-                    .filter(|s| s.source == source && !s.subagent)
-                    .filter(|s| {
-                        display_state(s).active()
-                            || self.finished.iter().any(|f| f.until > t && f.matches(s))
+                // 完成提示先显示六秒，再恢复同一来源中仍在运行的任务。
+                if let Some(finished) = self
+                    .finished
+                    .iter()
+                    .filter(|f| f.until > t && f.snapshot.source == source)
+                    .max_by(|a, b| {
+                        a.until
+                            .total_cmp(&b.until)
+                            .then_with(|| a.snapshot.activity_ms.cmp(&b.snapshot.activity_ms))
                     })
-                    .max_by_key(|s| (display_state(s).active(), s.activity_ms))
+                {
+                    return Some(&finished.snapshot);
+                }
+                self.sessions()
+                    .filter(|s| s.source == source && !s.subagent && display_state(s).active())
+                    .max_by_key(|s| s.activity_ms)
             })
             .collect()
     }
-    pub(crate) fn capsule_width(&self, t: f64) -> f32 {
-        let sources = self.capsule_sources();
-        let active = self.capsule_sessions(t).len();
-        active as f32 * 144.
-            + sources.len().saturating_sub(active) as f32 * 27.
-            + sources.len().saturating_sub(1) as f32 * 8.
+    fn capsule_source_widths(&self, t: f64, measure: impl Fn(&str) -> f32) -> Vec<f32> {
+        self.capsule_sources()
+            .into_iter()
+            .map(|source| {
+                // 同一来源只展示最近的任务，但为仍在运行的最长项目名留位。
+                self.capsule_candidates(t)
+                    .filter(|s| s.source == source && self.capsule_session_visible(s, t))
+                    .filter(|s| !s.project.is_empty())
+                    .map(|s| AGENT_PROJECT_PADDING + measure(&s.project).ceil())
+                    .fold(AGENT_ICON_WIDTH, f32::max)
+            })
+            .collect()
+    }
+    pub(crate) fn capsule_width(&self, ctx: &egui::Context, t: f64) -> f32 {
+        let widths = ctx.fonts(|fonts| {
+            self.capsule_source_widths(t, |project| {
+                fonts
+                    .layout_no_wrap(project.to_owned(), theme::font(10., W::Semibold), theme::WHITE)
+                    .size()
+                    .x
+            })
+        });
+        widths.iter().sum::<f32>()
+            + widths.len().saturating_sub(1) as f32 * AGENT_SOURCE_GAP
+    }
+    pub(crate) fn capsule_min_width(&self) -> f32 {
+        let count = self.capsule_sources().len();
+        count as f32 * AGENT_ICON_WIDTH
+            + count.saturating_sub(1) as f32 * AGENT_SOURCE_GAP
     }
     fn capsule_sources(&self) -> Vec<Source> {
         [Source::Codex, Source::Dsh]
@@ -141,40 +197,91 @@ impl State {
         self.picker = false;
     }
     pub fn receive(&mut self, update: agent::Update, t: f64) {
+        self.read_receipts=update.read_receipts;
         let terminal = |s: &Snapshot| {
             matches!(
                 s.state,
                 AgentState::Completed | AgentState::Interrupted | AgentState::Failed
             )
         };
-        let incoming = || update.recent.iter().chain(update.selected.iter());
+        // 摘要与正文可能跨过新一轮开始的时刻，同一会话只采用较新的快照。
+        let mut incoming: Vec<&Snapshot> = Vec::new();
+        for snapshot in update.recent.iter().chain(update.selected.iter()) {
+            if let Some(previous) = incoming.iter_mut()
+                .find(|s| s.source == snapshot.source && s.id == snapshot.id)
+            {
+                if snapshot.activity_ms >= previous.activity_ms {
+                    *previous = snapshot;
+                }
+            } else {
+                incoming.push(snapshot);
+            }
+        }
         let newly_finished: Vec<_> = if self.observing {
-            incoming()
+            incoming.iter().copied()
                 .filter(|new| {
-                    terminal(new)
-                        && self.sessions().any(|old| {
-                            old.source == new.source
-                                && old.id == new.id
-                                && old.turn_id == new.turn_id
-                                && display_state(old).active()
-                        })
+                    !new.subagent
+                        && terminal(new)
+                        && self
+                            .sessions()
+                            .filter(|old| old.source == new.source && old.id == new.id)
+                            .max_by_key(|old| old.activity_ms)
+                            .is_some_and(|old| {
+                                (old.turn_id == new.turn_id && old.state.active())
+                                    || (new.activity_ms > old.activity_ms
+                                        && new.ended_at.is_some()
+                                        && new.ended_at != old.ended_at)
+                            })
                 })
                 .map(|s| Finished {
-                    source: s.source,
-                    id: s.id.clone(),
-                    turn_id: s.turn_id.clone(),
+                    snapshot: s.summary(),
                     until: t + 6.,
                 })
                 .collect()
         } else {
             Vec::new()
         };
-        self.finished
-            .retain(|f| f.until > t && incoming().any(|s| f.matches(s) && terminal(s)));
+        // 只从已观察到的状态变化生成提醒，首次加载不回放历史完成。
+        let mut notifications: Vec<_> = newly_finished.iter()
+            .filter(|f| f.snapshot.state == AgentState::Completed)
+            .map(|f| f.snapshot.summary())
+            .collect();
+        if self.observing {
+            notifications.extend(incoming.iter().copied().filter(|new| {
+                !new.subagent && new.state == AgentState::Waiting
+                    && !self.waiting_notices.iter().any(|(source,id,turn)|
+                        *source == new.source && *id == new.id && *turn == new.turn_id)
+                    && self.sessions()
+                        .filter(|old| old.source == new.source && old.id == new.id)
+                        .max_by_key(|old| old.activity_ms)
+                        .is_none_or(|old| new.activity_ms >= old.activity_ms
+                            && (old.state != AgentState::Waiting || old.turn_id != new.turn_id))
+            }).map(Snapshot::summary));
+        }
+        // 列表短暂缺项不代表用户已答复；直到同一会话恢复执行才允许再次提醒。
+        self.waiting_notices.retain(|(source,id,turn)| !incoming.iter().any(|s|
+            s.source == *source && s.id == *id && (s.state != AgentState::Waiting || s.turn_id != *turn)));
+        for s in incoming.iter().filter(|s| !s.subagent && s.state == AgentState::Waiting) {
+            let key=(s.source,s.id.clone(),s.turn_id.clone());
+            if !self.waiting_notices.contains(&key) {self.waiting_notices.push(key);}
+        }
+        if self.waiting_notices.len() > 64 {
+            self.waiting_notices.drain(..self.waiting_notices.len() - 64);
+        }
+        self.notifications.extend(notifications);
+        if self.notifications.len() > 8 {
+            self.notifications.drain(..self.notifications.len() - 8);
+        }
+        self.finished.retain(|f| {
+            f.until > t
+                && !incoming.iter().any(|s| {
+                    f.snapshot.source == s.source
+                        && f.snapshot.id == s.id
+                        && (!f.matches(s) || s.state.active())
+                })
+        });
         for finished in newly_finished {
-            if !self.finished.iter().any(|f| {
-                f.source == finished.source && f.id == finished.id && f.turn_id == finished.turn_id
-            }) {
+            if !self.finished.iter().any(|f| f.matches(&finished.snapshot)) {
                 self.finished.push(finished);
             }
         }
@@ -205,6 +312,40 @@ impl State {
         self.dsh_status = update.dsh_status;
         self.observing = true;
     }
+    pub(crate) fn take_notifications(&mut self) -> Vec<Snapshot> {
+        std::mem::take(&mut self.notifications)
+    }
+    pub(crate) fn notification_current(&self, source: Source, path: &std::path::Path, turn: &str, state: AgentState) -> bool {
+        self.sessions().filter(|s| s.source == source && s.path == path)
+            .max_by_key(|s| s.activity_ms)
+            .is_none_or(|s| s.turn_id == turn && s.state == state)
+    }
+    fn read_receipt_for(&self, notice:&Snapshot)->Option<&agent::ReadReceipt> {
+        self.read_receipts.iter().find(|r|r.source==notice.source&&r.id==notice.id)
+            .map(|r|&r.receipt)
+            .or_else(||self.sessions().filter(|s|s.source==notice.source&&s.id==notice.id).max_by_key(|s|s.activity_ms).and_then(|s|s.read_receipt.as_ref()))
+    }
+    pub(crate) fn observe_notification_unread(&self, notice:&mut Snapshot) {
+        if let Some(read)=self.read_receipt_for(notice).filter(|read|read.ui_unread==Some(true)) {
+            if notice.read_receipt.as_ref().is_none_or(|old|old.ui_context.is_empty()||old.ui_context==read.ui_context) {
+                notice.read_receipt=Some(read.clone());
+            }
+        }
+    }
+    pub(crate) fn notification_read(&self, notice:&Snapshot)->bool {
+        self.read_receipt_for(notice)
+            .is_some_and(|read|read.covers(&notice.turn_id,notice.activity_ms,notice.read_receipt.as_ref()))
+    }
+    fn retain_enabled_sources(&mut self) {
+        self.read_receipts.retain(|r|self.config.source_enabled(r.source));
+        self.recent.retain(|s|self.config.source_enabled(s.source));
+        self.finished.retain(|f|self.config.source_enabled(f.snapshot.source));
+        self.notifications.retain(|s|self.config.source_enabled(s.source));
+        self.waiting_notices.retain(|(source,_,_)|self.config.source_enabled(*source));
+        if self.snapshot.as_ref().is_some_and(|s|!self.config.source_enabled(s.source)) {
+            self.release_body();self.snapshot=None;self.hold=None;self.desktop_at=None;
+        }
+    }
 }
 fn status_color(state: AgentState) -> Color32 {
     match state {
@@ -227,7 +368,7 @@ fn display_state(s: &Snapshot) -> AgentState {
         s.state
     }
 }
-fn draw_agent_symbol(c: &Card, source: Source, state: AgentState, x: f32, y: f32, t: f64) {
+pub(crate) fn draw_agent_symbol(c: &Card, source: Source, state: AgentState, x: f32, y: f32, t: f64) {
     if state == AgentState::Unknown {
         crate::quota_ui::monochrome_logo(c, source.provider(), x, y, 17., Color32::from_gray(166));
         return;
@@ -328,10 +469,10 @@ impl App {
                 || (self.settings_open && [3, 14].contains(&self.settings_tab) && self.page == 6));
         if full {
             Some(true)
-        } else if self.settings.agent_capsule
-            && !self.effective_minimal()
-            && !self.open
-            && self.t >= self.notification_bell_until
+        } else if (self.settings.notifications && [Source::Codex,Source::Dsh].into_iter().any(|s|self.ai.config.notifications_enabled(s)))
+            || (self.settings.agent_capsule && (!self.effective_minimal()
+                && !self.open
+                && self.t >= self.notification_bell_until))
         {
             Some(false)
         } else {
@@ -339,11 +480,15 @@ impl App {
         }
     }
     pub fn agent_tick(&mut self, ctx: &egui::Context, visible: bool) {
+        self.ai.retain_enabled_sources();
         let Some(full) = self.agent_demand(visible) else {
             self.ai.service = None;
             self.ai.hold = None;
             self.ai.observing = false;
             self.ai.finished.clear();
+            self.ai.notifications.clear();
+            self.ai.waiting_notices.clear();
+            self.ai.read_receipts.clear();
             self.ai.release_body();
             return;
         };
@@ -432,22 +577,28 @@ impl App {
             .into_iter()
             .map(Snapshot::summary)
             .collect();
-        let used_width = width.min(self.ai.capsule_width(self.t));
-        let idle_count = sources.len().saturating_sub(sessions.len());
-        let active_width = if sessions.is_empty() {
-            27.
+        let mut widths = if side {
+            vec![AGENT_ICON_WIDTH; sources.len()]
         } else {
-            ((used_width - sources.len().saturating_sub(1) as f32 * 8. - idle_count as f32 * 27.)
-                / sessions.len() as f32)
-                .max(27.)
+            self.ai.capsule_source_widths(self.t, |project| c.text_w(project, 10., W::Semibold))
         };
+        let preferred = widths.iter().sum::<f32>()
+            + sources.len().saturating_sub(1) as f32 * AGENT_SOURCE_GAP;
+        let used_width = width.min(preferred);
+        let minimum = self.ai.capsule_min_width();
+        if preferred > used_width && preferred > minimum {
+            let fit = ((used_width - minimum) / (preferred - minimum)).clamp(0., 1.);
+            for cell in &mut widths {
+                *cell = AGENT_ICON_WIDTH + (*cell - AGENT_ICON_WIDTH) * fit;
+            }
+        }
         let mut left = x - used_width / 2.;
         let mut chosen = None;
         let mut clicked = false;
         for (i, source) in sources.iter().copied().enumerate() {
             let session = sessions.iter().find(|s| s.source == source);
             let state = session.map(display_state).unwrap_or_default();
-            let cell_width = if session.is_some() { active_width } else { 27. };
+            let cell_width = widths[i];
             let (cx, cy) = if side {
                 (
                     x,
@@ -459,15 +610,19 @@ impl App {
             draw_agent_symbol(c, source, state, cx, cy, self.t);
             if !side {
                 if let Some(s) = session {
-                    c.centered_text(
-                        left + 31.,
-                        cy,
-                        &c.fit(&s.project, 10., W::Semibold, (cell_width - 35.).max(0.)),
-                        10.,
-                        W::Semibold,
-                        theme::WHITE,
-                        H::Left,
-                    );
+                    let text_width = (cell_width - AGENT_PROJECT_PADDING).max(0.);
+                    let project = c.fit(&s.project, 10., W::Semibold, text_width);
+                    if c.text_w(&project, 10., W::Semibold) <= text_width {
+                        c.centered_text(
+                            left + AGENT_PROJECT_INSET,
+                            cy,
+                            &project,
+                            10.,
+                            W::Semibold,
+                            theme::WHITE,
+                            H::Left,
+                        );
+                    }
                 }
             }
             let known = session.or_else(|| {
@@ -528,7 +683,7 @@ impl App {
                 chosen = known.map(Snapshot::summary);
                 clicked = true;
             }
-            left += cell_width + 8.;
+            left += cell_width + AGENT_SOURCE_GAP;
         }
         if clicked {
             self.ai.release_body();
@@ -1040,97 +1195,89 @@ impl App {
     pub(crate) fn ai_settings(&mut self, ui: &mut egui::Ui) {
         let before = self.ai.config.clone();
         crate::extras::settings_card(ui, |ui| {
-            crate::extras::settings_control_row_right(ui, "Agent 状态胶囊", |ui| {
-                crate::extras::agent_capsule_switch(ui, &mut self.settings.agent_capsule);
-            });
+            crate::extras::agent_source_row(ui, "Codex", Source::Codex, "enabled", &mut self.ai.config.codex_enabled);
             crate::extras::settings_hint(
                 ui,
-                "与 AI 额度分别控制；Codex 与 DSH 各自显示状态动画，空闲时各自变灰。",
+                "桌面版 / CLI 会话。关闭后停止读取，并隐藏 Codex 胶囊与提醒。",
             );
+            ui.add_enabled_ui(self.ai.config.codex_enabled, |ui| {
+                crate::extras::agent_source_row(ui, "完成与询问通知", Source::Codex, "notifications", &mut self.ai.config.codex_notifications);
+                crate::extras::settings_hint(ui, "先弹出通知，随后在最右侧保留提醒图标，点击查看后清除。");
+                ui.label(
+                    egui::RichText::new("Codex 数据目录")
+                        .size(11.)
+                        .color(ui.visuals().weak_text_color()),
+                );
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [(ui.available_width() - 66.).max(100.), 26.],
+                        egui::TextEdit::singleline(&mut self.ai.config.directory)
+                            .hint_text("自动使用 CODEX_HOME 或用户 .codex 目录"),
+                    );
+                    if ui.button("选择…").clicked() {
+                        self.pending.push(Cmd::AgentChooseDirectory);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.small_button("使用默认目录").clicked() {
+                        self.ai.config.directory.clear();
+                        self.ai.config.pinned = None;
+                        self.ai.hold = None;
+                        self.ai.snapshot = None;
+                    }
+                    if ui.small_button("自动跟随").clicked() {
+                        self.ai.config.pinned = None;
+                        self.ai.hold = None;
+                    }
+                    if ui.small_button("重新读取").clicked() {
+                        self.ai.service = None;
+                        self.ai.error = None;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("每个来源显示最近的活跃会话；会话正文只在展开时加载。")
+                        .size(11.)
+                        .color(ui.visuals().weak_text_color()),
+                );
+            });
         });
         crate::extras::settings_card(ui, |ui| {
-            crate::extras::setting_row(
-                ui,
-                "Agent 会话",
-                "按需读取最近一轮公开消息",
-                &mut self.ai.config.enabled,
-            );
-            ui.label(
-                egui::RichText::new("会话来源")
-                    .size(11.)
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.horizontal_wrapped(|ui| {
-                ui.checkbox(&mut self.ai.config.codex_enabled, "Codex 桌面版 / CLI");
-                ui.checkbox(&mut self.ai.config.dsh_enabled, "DSH 桌面版");
-            });
-            ui.label(
-                egui::RichText::new("Codex 数据目录")
-                    .size(11.)
-                    .color(ui.visuals().weak_text_color()),
-            );
-            ui.horizontal(|ui| {
+            crate::extras::agent_source_row(ui, "DSH", Source::Dsh, "enabled", &mut self.ai.config.dsh_enabled);
+            crate::extras::settings_hint(ui, "桌面版会话。关闭后停止读取，并隐藏 DSH 胶囊与提醒。");
+            ui.add_enabled_ui(self.ai.config.dsh_enabled, |ui| {
+                crate::extras::agent_source_row(ui, "完成与询问通知", Source::Dsh, "notifications", &mut self.ai.config.dsh_notifications);
+                crate::extras::settings_hint(ui, "先弹出通知，随后在最右侧保留提醒图标，点击查看后清除。");
+                ui.label(egui::RichText::new("只读事件桥接").size(12.).strong());
                 ui.add_sized(
-                    [(ui.available_width() - 66.).max(100.), 26.],
-                    egui::TextEdit::singleline(&mut self.ai.config.directory)
-                        .hint_text("自动使用 CODEX_HOME 或用户 .codex 目录"),
+                    [ui.available_width(), 26.],
+                    egui::TextEdit::singleline(&mut self.ai.config.dsh_discovery)
+                        .hint_text("默认：本机 DSH 桥接发现文件"),
                 );
-                if ui.button("选择…").clicked() {
-                    self.pending.push(Cmd::AgentChooseDirectory);
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.small_button("使用默认目录").clicked() {
-                    self.ai.config.directory.clear();
-                    self.ai.config.pinned = None;
-                    self.ai.hold = None;
-                    self.ai.snapshot = None;
-                }
-                if ui.small_button("自动跟随").clicked() {
-                    self.ai.config.pinned = None;
-                    self.ai.hold = None;
-                }
-                if ui.small_button("重新读取").clicked() {
-                    self.ai.service = None;
-                    self.ai.error = None;
-                }
-            });
-            ui.label(
-                egui::RichText::new("每个来源显示最近的活跃会话；会话正文只在展开时加载。")
+                let installed = self.ai.config.sources().dsh.is_some_and(|p| p.exists());
+                ui.label(
+                    egui::RichText::new(if !self.ai.config.dsh_enabled {
+                        "DSH 会话读取已关闭"
+                    } else if !self.ai.dsh_status.is_empty() {
+                        self.ai.dsh_status.as_str()
+                    } else if installed {
+                        "桥接插件已启动，显示会话时连接"
+                    } else {
+                        "等待桥接插件，首次使用请运行安装脚本"
+                    })
                     .size(11.)
                     .color(ui.visuals().weak_text_color()),
-            );
-            ui.separator();
-            ui.label(egui::RichText::new("DSH 只读事件桥接").size(12.).strong());
-            ui.add_sized(
-                [ui.available_width(), 26.],
-                egui::TextEdit::singleline(&mut self.ai.config.dsh_discovery)
-                    .hint_text("默认：本机 DSH 桥接发现文件"),
-            );
-            let installed = self.ai.config.sources().dsh.is_some_and(|p| p.exists());
-            ui.label(
-                egui::RichText::new(if !self.ai.config.dsh_enabled {
-                    "DSH 会话读取已关闭"
-                } else if !self.ai.dsh_status.is_empty() {
-                    self.ai.dsh_status.as_str()
-                } else if installed {
-                    "桥接插件已启动，显示会话时连接"
-                } else {
-                    "等待桥接插件，首次使用请运行安装脚本"
-                })
-                .size(11.)
-                .color(ui.visuals().weak_text_color()),
-            );
-            if ui.small_button("打开桥接安装目录").clicked() {
-                let bundled = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|p| p.join("dsh-bridge")))
-                    .filter(|p| p.is_dir());
-                self.pending.push(Cmd::Open(bundled.unwrap_or_else(|| {
-                    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                        .join("plugins/dsh-island-bridge")
-                })));
-            }
+                );
+                if ui.small_button("打开桥接安装目录").clicked() {
+                    let bundled = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| p.parent().map(|p| p.join("dsh-bridge")))
+                        .filter(|p| p.is_dir());
+                    self.pending.push(Cmd::Open(bundled.unwrap_or_else(|| {
+                        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                            .join("plugins/dsh-island-bridge")
+                    })));
+                }
+            });
         });
         if before.directory != self.ai.config.directory {
             self.ai.config.pinned = None;
@@ -1139,6 +1286,7 @@ impl App {
             self.ai.release_body();
         }
         if before != self.ai.config {
+            self.ai.retain_enabled_sources();
             if self.ai.config.pinned.as_ref().is_some_and(|p| {
                 !self
                     .ai
@@ -1153,16 +1301,24 @@ impl App {
                 self.ai.hold = None;
             }
             self.ai.config.save();
+            self.tick_alerts();
         }
         ui.add_space(12.);
         crate::extras::settings_label(ui, "账户与额度");
         self.quota_settings(ui);
     }
     pub(crate) fn ai_settings_preview(&mut self, ui: &mut egui::Ui) {
+        if !self.ai.config.source_enabled(self.ai.preview_source) {
+            let Some(source)=[Source::Codex,Source::Dsh].into_iter().find(|s|self.ai.config.source_enabled(*s)) else {
+                crate::extras::settings_hint(ui,"开启 Codex 或 DSH 后可预览状态显示。");return;
+            };
+            self.ai.preview_source=source;
+        }
         crate::extras::settings_label(ui, "显示预览 · 示例数据");
         ui.horizontal_wrapped(|ui| {
-            ui.selectable_value(&mut self.ai.preview_source, Source::Codex, "Codex");
-            ui.selectable_value(&mut self.ai.preview_source, Source::Dsh, "DSH");
+            for source in [Source::Codex,Source::Dsh] {if self.ai.config.source_enabled(source) {
+                ui.selectable_value(&mut self.ai.preview_source,source,source.label());
+            }}
             for (i, label) in ["运行", "完成", "空闲", "异常", "待确认", "同时运行", "思考"]
                 .into_iter()
                 .enumerate()
@@ -1183,6 +1339,7 @@ impl App {
             _ => AgentState::Working,
         };
         let mut demo = State::default();
+        demo.config=self.ai.config.clone();
         demo.snapshot = Some(Snapshot {
             source,
             id: "preview".into(),
@@ -1223,9 +1380,7 @@ impl App {
         });
         if preview == 1 {
             demo.finished.push(Finished {
-                source,
-                id: "preview".into(),
-                turn_id: String::new(),
+                snapshot: demo.snapshot.as_ref().unwrap().summary(),
                 until: self.t + 6.,
             });
         }
@@ -1255,7 +1410,7 @@ impl App {
             &card,
             0.,
             0.,
-            (rect.width() - 24.).min(self.ai.capsule_width(self.t)),
+            rect.width() - 24.,
             false,
         );
         self.feature_page_preview(ui, 6);

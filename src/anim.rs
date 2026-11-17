@@ -3,7 +3,7 @@
 //! 所有形变都用「带速度的弹簧」驱动：目标随时可改，速度保留，
 //! 所以展开途中移开、收起途中回来都不会跳变，这是「丝滑」的关键。
 
-/// 二阶阻尼弹簧 `x'' = -k(x - target) - c·x'`，半隐式欧拉 + 子步长积分。
+/// 二阶阻尼弹簧 `x'' = -k(x - target) - c·x'`，按解析解推进。
 #[derive(Clone, Copy, Debug)]
 pub struct Spring {
     pub pos: f32,
@@ -33,15 +33,36 @@ impl Spring {
     }
 
     pub fn step(&mut self, dt: f32) {
-        // 掉帧时限幅，避免一帧跨太远；子步 ≤ 1/480 s，保证在 30–240 Hz 下轨迹一致。
-        let dt = dt.clamp(0.0, 0.1);
-        let n = (dt * 480.0).ceil().max(1.0) as usize;
-        let h = dt / n as f32;
-        for _ in 0..n {
-            let a = -self.k * (self.pos - self.target) - self.c * self.vel;
-            self.vel += a * h;
-            self.pos += self.vel * h;
-        }
+        // 掉帧仍限幅；解析解消除不同帧长、分段推进带来的轨迹和速度误差。
+        let dt = dt.clamp(0.0, 0.1) as f64;
+        if dt == 0.0 { return; }
+        let x = (self.pos - self.target) as f64;
+        let v = self.vel as f64;
+        let decay = self.c as f64 * 0.5;
+        let k = self.k as f64;
+        let discriminant = k - decay * decay;
+        let (x, v) = if discriminant.abs() <= k.max(1.0) * 1e-6 {
+            let b = v + decay * x;
+            let e = (-decay * dt).exp();
+            ((x + b * dt) * e, (v - decay * b * dt) * e)
+        } else if discriminant > 0.0 {
+            let frequency = discriminant.sqrt();
+            let (sin, cos) = (frequency * dt).sin_cos();
+            let e = (-decay * dt).exp();
+            ((x * cos + (v + decay * x) * sin / frequency) * e,
+             (v * cos - (decay * v + k * x) * sin / frequency) * e)
+        } else {
+            let root = (-discriminant).sqrt();
+            let fast = -decay - root;
+            let slow = -k / (decay + root);
+            let a = (v - fast * x) / (slow - fast);
+            let b = x - a;
+            let a = a * (slow * dt).exp();
+            let b = b * (fast * dt).exp();
+            (a + b, slow * a + fast * b)
+        };
+        self.pos = self.target + x as f32;
+        self.vel = v as f32;
     }
 
     /// 相对 `scale` 足够接近目标且几乎静止。
@@ -148,5 +169,31 @@ mod tests {
             b.step(1.0 / 144.0);
         }
         assert!((a.pos - b.pos).abs() < 0.01);
+    }
+
+    #[test]
+    fn critically_damped_matches_continuous_trajectory() {
+        let mut spring = Spring::new(0.0, 400.0, 1.0);
+        spring.target = 1.0;
+        spring.step(0.1);
+        let decay = (-2.0_f32).exp();
+        assert!((spring.pos - (1.0 - 3.0 * decay)).abs() < 1e-5);
+        assert!((spring.vel - 40.0 * decay).abs() < 1e-4);
+    }
+
+    #[test]
+    fn spring_trajectory_is_independent_of_frame_partition() {
+        for damping in [0.7, 1.0, 1.4] {
+            let mut coarse = Spring::new(0.2, 330.0, damping);
+            coarse.target = 1.0;
+            coarse.vel = -0.6;
+            let mut fine = coarse;
+            coarse.step(0.1);
+            for _ in 0..9 {
+                fine.step(1.0 / 90.0);
+            }
+            assert!((coarse.pos - fine.pos).abs() < 1e-5, "阻尼 {damping} 的位置不应受帧分割影响");
+            assert!((coarse.vel - fine.vel).abs() < 1e-4, "阻尼 {damping} 的速度不应受帧分割影响");
+        }
     }
 }

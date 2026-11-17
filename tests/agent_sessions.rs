@@ -5,6 +5,45 @@ fn event(p: &mut Parser, at: i64, payload: serde_json::Value) {
     p.ingest(&json!({"timestamp":chrono::DateTime::from_timestamp(at,0).unwrap().to_rfc3339(),"type":"event_msg","payload":payload}));
 }
 #[test]
+fn agent_question_tool_waits_for_its_own_reply_without_retaining_arguments() {
+    for full in [false,true] {
+        let mut p=Parser::new(full);
+        event(&mut p,100,json!({"type":"task_started","turn_id":"question-turn"}));
+        p.ingest(&json!({"timestamp":"1970-01-01T00:01:41Z","type":"response_item","payload":{"type":"function_call","name":"functions.request_user_input","call_id":"question","arguments":"私密询问参数"}}));
+        assert_eq!(p.snapshot().state,AgentState::Waiting,"明确的询问工具调用应进入待确认状态");
+        p.ingest(&json!({"timestamp":"1970-01-01T00:01:42Z","type":"response_item","payload":{"type":"function_call_output","call_id":"other","output":"其他工具结果"}}));
+        assert_eq!(p.snapshot().state,AgentState::Waiting);
+        assert!(p.snapshot().messages.is_empty(),"通知无需保存工具参数或结果");
+        event(&mut p,102,json!({"type":"agent_message","phase":"commentary","message":"请确认"}));
+        assert_eq!(p.snapshot().state,AgentState::Waiting,"公开进展不能覆盖尚未答复的询问");
+        p.ingest(&json!({"timestamp":"1970-01-01T00:01:43Z","type":"response_item","payload":{"type":"function_call_output","call_id":"question","output":"私密用户选项"}}));
+        assert_eq!(p.snapshot().state,AgentState::Working,"用户答复后退出等待状态");
+        assert!(p.snapshot().messages.iter().all(|m|m.text=="请确认"));
+        event(&mut p,104,json!({"type":"task_complete"}));
+        p.ingest(&json!({"timestamp":"1970-01-01T00:01:45Z","type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"late","arguments":"{}"}}));
+        assert_eq!(p.snapshot().state,AgentState::Completed,"完成后镜像工具不能覆盖结束状态");
+    }
+}
+#[test]
+fn agent_async_question_keeps_waiting_after_ack_until_the_user_replies() {
+    let mut p=Parser::new(false);
+    event(&mut p,100,json!({"type":"task_started","turn_id":"async-question"}));
+    p.ingest(&json!({"timestamp":"1970-01-01T00:01:41Z","type":"response_item","payload":{"type":"function_call","name":"functions.request_user_input_async","call_id":"question","arguments":"私密询问参数"}}));
+    assert_eq!(p.snapshot().state,AgentState::Waiting);
+    p.ingest(&json!({"timestamp":"1970-01-01T00:01:42Z","type":"response_item","payload":{"type":"function_call_output","call_id":"question","output":"{\"accepted\":true}"}}));
+    assert_eq!(p.snapshot().state,AgentState::Waiting,"异步受理回执不是用户答复");
+    event(&mut p,103,json!({"type":"agent_reasoning"}));
+    assert_eq!(p.snapshot().state,AgentState::Waiting,"继续处理其他工作时仍需保留询问提醒");
+    event(&mut p,104,json!({"type":"task_complete"}));
+    assert_eq!(p.snapshot().state,AgentState::Waiting,"仍有询问时不能误报完成");
+    event(&mut p,105,json!({"type":"user_message","message":"选择第一项"}));
+    assert_eq!(p.snapshot().state,AgentState::Thinking);
+    event(&mut p,106,json!({"type":"task_started","turn_id":"after-reply"}));
+    event(&mut p,107,json!({"type":"task_complete"}));
+    assert_eq!(p.snapshot().state,AgentState::Completed);
+    assert!(p.snapshot().messages.is_empty());
+}
+#[test]
 fn agent_cli_latest_turn_deduplicates_mirrors_and_keeps_terminal_state() {
     let mut p = Parser::new(true);
     event(

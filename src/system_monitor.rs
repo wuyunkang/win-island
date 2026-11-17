@@ -12,6 +12,68 @@ pub mod native;
 const DEFAULT_COLORS: [&str; 6] = [
     "#68B9FF", "#B69AFF", "#67DDB0", "#63CFE8", "#FFBD78", "#F38BA8",
 ];
+pub(crate) const RATE_UNITS: [&str; 8] = [
+    "KB/s", "MB/s", "GB/s", "TB/s", "PB/s", "EB/s", "ZB/s", "YB/s",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Reading {
+    Cpu,
+    Memory,
+    Gpu,
+    Download,
+    Upload,
+    Storage,
+}
+impl Reading {
+    pub const ALL: [Self; 6] = [
+        Self::Cpu,
+        Self::Memory,
+        Self::Gpu,
+        Self::Download,
+        Self::Upload,
+        Self::Storage,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Cpu => "CPU",
+            Self::Memory => "内存",
+            Self::Gpu => "GPU",
+            Self::Download => "下载",
+            Self::Upload => "上传",
+            Self::Storage => "磁盘",
+        }
+    }
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Cpu => "处理器使用率与趋势",
+            Self::Memory => "物理内存占用与趋势",
+            Self::Gpu => "显卡使用率与趋势",
+            Self::Download => "实时下载速度",
+            Self::Upload => "实时上传速度",
+            Self::Storage => "固定磁盘空间占用",
+        }
+    }
+    /// 胶囊单项的参考宽度；实际布局按当前字体预留三位读数。
+    pub fn capsule_width(self) -> f32 {
+        if matches!(self, Self::Download | Self::Upload) {
+            84.
+        } else {
+            46.
+        }
+    }
+    pub fn value(self, sample: &Sample) -> String {
+        match self {
+            Self::Cpu => percent(sample.cpu),
+            Self::Memory => percent(sample.memory_percent()),
+            Self::Gpu => percent(sample.gpu),
+            Self::Download => rate(sample.download),
+            Self::Upload => rate(sample.upload),
+            Self::Storage => percent(sample.storage_percent()),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Palette {
@@ -44,11 +106,15 @@ impl Palette {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    #[serde(skip)]
-    pub(crate) compact: bool,
     pub interval: u32,
+    pub show_cpu: bool,
+    pub show_memory: bool,
+    pub show_gpu: bool,
+    pub show_download: bool,
+    pub show_upload: bool,
     pub show_processes: bool,
     pub show_storage: bool,
+    pub capsule_readings: [bool; 6],
     pub sort_memory: bool,
     pub palette: Palette,
     pub custom_colors: [String; 6],
@@ -56,10 +122,15 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            compact: false,
             interval: 1,
+            show_cpu: true,
+            show_memory: true,
+            show_gpu: true,
+            show_download: true,
+            show_upload: true,
             show_processes: true,
             show_storage: true,
+            capsule_readings: [true, true, false, false, false, false],
             sort_memory: false,
             palette: Palette::Classic,
             custom_colors: DEFAULT_COLORS.map(str::to_owned),
@@ -67,6 +138,56 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    pub fn expanded_reading(&self, reading: Reading) -> bool {
+        match reading {
+            Reading::Cpu => self.show_cpu,
+            Reading::Memory => self.show_memory,
+            Reading::Gpu => self.show_gpu,
+            Reading::Download => self.show_download,
+            Reading::Upload => self.show_upload,
+            Reading::Storage => self.show_storage,
+        }
+    }
+    pub fn set_expanded_reading(&mut self, reading: Reading, enabled: bool) {
+        *match reading {
+            Reading::Cpu => &mut self.show_cpu,
+            Reading::Memory => &mut self.show_memory,
+            Reading::Gpu => &mut self.show_gpu,
+            Reading::Download => &mut self.show_download,
+            Reading::Upload => &mut self.show_upload,
+            Reading::Storage => &mut self.show_storage,
+        } = enabled;
+    }
+    pub fn capsule_items(&self) -> impl Iterator<Item = Reading> + '_ {
+        Reading::ALL
+            .into_iter()
+            .filter(|r| self.capsule_readings[*r as usize])
+    }
+    /// 已选胶囊项目的参考宽度，实际宽度由界面按字体测量。
+    pub fn capsule_width(&self) -> f32 {
+        (self
+            .capsule_items()
+            .map(|r| r.capsule_width() + 8.)
+            .sum::<f32>()
+            - 8.)
+            .max(0.)
+    }
+    pub fn has_readings(&self) -> bool {
+        self.show_processes || Reading::ALL.into_iter().any(|r| self.expanded_reading(r))
+    }
+    /// 展开页和胶囊分别申请读数，关闭的采样器不保留平台句柄或缓存。
+    pub fn sampling_for_views(&self, expanded: bool, capsule: bool) -> Self {
+        let mut sampling = self.clone();
+        for reading in Reading::ALL {
+            sampling.set_expanded_reading(
+                reading,
+                (expanded && self.expanded_reading(reading))
+                    || (capsule && self.capsule_readings[reading as usize]),
+            );
+        }
+        sampling.show_processes &= expanded;
+        sampling
+    }
     pub fn normalize(&mut self) {
         self.interval = self.interval.clamp(1, 5);
         for (color, default) in self.custom_colors.iter_mut().zip(DEFAULT_COLORS) {
@@ -130,6 +251,12 @@ pub struct Sample {
     pub processes: Vec<Process>,
 }
 impl Sample {
+    pub fn storage_percent(&self) -> Option<f64> {
+        let total: f64 = self.drives.iter().map(|d| d.total as f64).sum();
+        (total > 0.).then(|| {
+            (self.drives.iter().map(|d| d.used as f64).sum::<f64>() / total * 100.).clamp(0., 100.)
+        })
+    }
     pub fn memory_percent(&self) -> Option<f64> {
         let total = self.memory_total.filter(|v| *v > 0)?;
         Some((self.memory_used? as f64 / total as f64 * 100.).clamp(0., 100.))
@@ -300,16 +427,24 @@ pub fn bytes(value: u64) -> String {
     }
 }
 pub fn rate(value: Option<f64>) -> String {
-    value.map_or_else(
-        || "—".into(),
-        |v| {
-            if v >= 1_048_576. {
-                format!("{:.1} MB/s", v / 1_048_576.)
-            } else {
-                format!("{:.0} KB/s", v / 1024.)
-            }
-        },
-    )
+    let Some(value) = value.filter(|v| v.is_finite() && *v >= 0.) else {
+        return "—".into();
+    };
+    let mut scaled = value / 1024.;
+    let mut unit = 0;
+    // 按显示时的四舍五入切换，避免出现 1000 KB/s 或 1000 MB/s。
+    while scaled >= 999.5 && unit + 1 < RATE_UNITS.len() {
+        scaled /= 1024.;
+        unit += 1;
+    }
+    if scaled >= 999.5 {
+        return "—".into();
+    }
+    if unit == 0 || (scaled * 10.).round() >= 1000. {
+        format!("{scaled:.0} {}", RATE_UNITS[unit])
+    } else {
+        format!("{scaled:.1} {}", RATE_UNITS[unit])
+    }
 }
 
 #[cfg(test)]

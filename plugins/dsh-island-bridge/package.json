@@ -1,9 +1,11 @@
 {
   "name": "win-island-dsh-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "灵动岛的 DSH 只读会话桥接，无独立界面或模型调用",
   "main": "index.mjs",
+  "exports": {".":"./index.mjs","./client":"./client.js","./package.json":"./package.json"},
+  "dsh": {"client":{"platform":"web","inject":["@deepseek-ai/dsh-client-connection","@deepseek-ai/dsh-api-session-controller","@deepseek-ai/dsh-client-ui-session"]}},
   "license": "MIT",
   "scripts": { "test": "node --test test/*.test.mjs" },
   "engines": { "node": ">=22.19.0" }

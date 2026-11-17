@@ -9,13 +9,286 @@ fn agent_capsule_sample(source: crate::agent_sessions::Source, state: crate::age
     crate::agent_sessions::Snapshot {source,id:id.into(),path:format!("{id}.jsonl").into(),project:project.into(),title:format!("{project}的任务"),state,turn_id:"turn".into(),updated_at:chrono::Utc::now().timestamp(),activity_ms:chrono::Utc::now().timestamp_millis(),..Default::default()}
 }
 fn agent_capsule_output(h:&mut H,side:bool,events:Vec<egui::Event>)->egui::FullOutput {
+    agent_capsule_output_at_width(h,side,events,328.)
+}
+fn agent_capsule_output_at_width(h:&mut H,side:bool,events:Vec<egui::Event>,width:f32)->egui::FullOutput {
     h.t+=1.0/60.0;h.app.t=h.t;
     h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(500.,200.))),time:Some(h.t),events,..Default::default()},|ctx|{
-        egui::CentralPanel::default().show(ctx,|ui|{let card=crate::paint::Card::new(ui,Pos2::new(250.,100.),ui.clip_rect());h.app.draw_ai_chip(&card,0.,0.,328.,side);});
+        egui::CentralPanel::default().show(ctx,|ui|{let card=crate::paint::Card::new(ui,Pos2::new(250.,100.),ui.clip_rect());h.app.draw_ai_chip(&card,0.,0.,width,side);});
     })
 }
 fn agent_capsule_text(output:&egui::FullOutput)->Vec<String> {
     output.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text().to_owned()),_=>None}).collect()
+}
+#[test]
+fn agent_notifications_clear_from_session_read_receipts_without_clicks() {
+    use crate::agent_sessions::{AgentState,Source,Update,ReadReceipt,SessionReadReceipt};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for source in [Source::Codex,Source::Dsh] {for state in [AgentState::Completed,AgentState::Waiting] {
+        let mut h=H::new();h.app.settings.notifications=true;
+        let mut task=agent_capsule_sample(source,AgentState::Working,"read-one","已读项目");
+        let mut other=task.clone();other.id="unread-other".into();other.path="unread-other.jsonl".into();
+        h.app.ai.receive(Update{recent:vec![task.clone(),other.clone()],..Default::default()},h.t);
+        task.state=state;task.activity_ms+=100;other.state=state;other.activity_ms+=100;
+        h.app.ai.receive(Update{recent:vec![task.clone(),other.clone()],..Default::default()},h.t);h.frame(vec![]);
+        assert_eq!(h.app.pending_agents.len(),2);
+        let read=if source==Source::Codex {
+            ReadReceipt {revision:"read".into(),last_published_turn:Some(task.turn_id.clone()),..Default::default()}
+        }else{ReadReceipt {viewed_at_ms:Some(task.activity_ms),..Default::default()}};
+        h.app.ai.receive(Update {recent:vec![task.clone(),other.clone()],read_receipts:vec![SessionReadReceipt {source,id:task.id.clone(),receipt:read}],..Default::default()},h.t);
+        h.frame(vec![]);
+        assert_eq!(h.app.pending_agents.len(),1,"从原应用查看会话后应自动清除提醒");
+        assert_eq!(h.app.pending_agents[0].id,other.id,"不能清掉同一应用的其他会话");
+        assert!(!h.cmds.iter().any(|c|matches!(c,crate::app::Cmd::AgentReturn(_))),"已读同步不能主动切换窗口");
+        assert!(h.app.notice.as_ref().is_none_or(|a|!matches!(&a.source,crate::extras::AlertSource::Agent {path,..} if path==&task.path)));
+        h.app.ai.receive(Update{recent:vec![task,other],..Default::default()},h.t);h.frame(vec![]);
+        assert_eq!(h.app.pending_agents.len(),1,"旧快照不能复活已读提醒");
+    }}
+}
+#[test]
+fn agent_notifications_remember_unread_status_until_it_is_acknowledged() {
+    use crate::agent_sessions::{AgentState,Source,Update,ReadReceipt,SessionReadReceipt};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings.notifications=true;
+    let mut task=agent_capsule_sample(Source::Codex,AgentState::Working,"pending-question","询问项目");
+    let mut receipt=ReadReceipt {revision:"old".into(),last_published_turn:Some("old-turn".into()),ui_unread:Some(false),ui_context:"owner/local".into(),..Default::default()};
+    task.read_receipt=Some(receipt.clone());
+    h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+    task.state=AgentState::Waiting;h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);h.frame(vec![]);
+    assert_eq!(h.app.pending_agents.len(),1);
+    receipt.ui_unread=Some(true);
+    let update=|receipt:ReadReceipt|Update {recent:vec![task.clone()],read_receipts:vec![SessionReadReceipt {source:Source::Codex,id:task.id.clone(),receipt}],..Default::default()};
+    h.app.ai.receive(update(receipt.clone()),h.t);h.frame(vec![]);assert_eq!(h.app.pending_agents.len(),1);
+    receipt.ui_unread=Some(false);
+    h.app.ai.receive(update(receipt),h.t);h.frame(vec![]);
+    assert!(h.app.pending_agents.is_empty(),"通知后才出现的未读标记也应记住，查看后自动清除");
+}
+#[test]
+fn agent_notifications_complete_and_waiting_use_banner_actions() {
+    use crate::agent_sessions::{AgentState, Source, Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for source in [Source::Codex,Source::Dsh] {for state in [AgentState::Completed,AgentState::Waiting] {
+        let mut h=H::new();h.app.settings.agent_capsule=true;h.app.settings.notifications=true;
+        let mut task=agent_capsule_sample(source,AgentState::Working,"notice","通知项目");
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        task.state=state;task.activity_ms+=100;
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        for _ in 0..60 {h.frame(vec![]);}
+        let notice=h.app.notice.as_ref().expect("Agent 完成与询问应弹出通知");
+        assert!(notice.title.contains(source.label()));
+        assert!(notice.title.contains(if state==AgentState::Completed {"任务完成"} else {"需要确认"}));
+        assert!(notice.body.contains("通知项目"));assert!(notice.messenger().is_none());
+        let at=notice.at;
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);h.frame(vec![]);
+        assert_eq!(h.app.notice.as_ref().unwrap().at,at,"重复采样不能延长弹窗");
+        h.click_text("查看");assert!(h.cmds.contains(&crate::app::Cmd::AgentReturn(source)));
+        assert!(h.app.notice.is_none());
+        h.app.ai.receive(Update{recent:vec![task],..Default::default()},h.t);h.frame(vec![]);
+        assert!(h.app.notice.is_none(),"查看后重复快照不能重新弹窗");
+    }}
+}
+#[test]
+fn agent_notifications_clear_on_resume_and_respect_switches() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.agent_capsule=true;h.app.settings.notifications=true;
+    let mut task=agent_capsule_sample(Source::Codex,AgentState::Completed,"switches","通知项目");
+    h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);h.frame(vec![]);
+    assert!(h.app.notice.is_none(),"启动时不回放历史完成");
+    for disabled in [0,1,2,3] {
+        task.state=AgentState::Working;task.activity_ms+=100;
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        task.state=AgentState::Waiting;task.activity_ms+=100;
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        h.frame(vec![]);assert!(h.app.notice.is_some());
+        match disabled {
+            0=>{task.state=AgentState::Working;task.activity_ms+=100;h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);},
+            1=>h.app.settings.notifications=false,
+            2=>h.app.ai.config.codex_enabled=false,
+            _=>{for _ in 0..60 {h.frame(vec![]);}h.click_text("关闭");},
+        }
+        h.frame(vec![]);assert!(h.app.notice.is_none());assert!(h.app.alerts.is_empty());
+        if disabled==2 {assert!(h.app.ai_capsule_chip(),"关闭一个来源后，仍开启的来源应立即恢复胶囊");}
+        h.app.settings.notifications=true;h.app.ai.config.codex_enabled=true;
+    }
+}
+#[test]
+fn agent_notifications_keep_metadata_monitoring_during_other_views_and_banners() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.agent_capsule=true;h.app.settings.notifications=true;
+    h.app.open=true;h.app.page=0;
+    assert_eq!(h.app.agent_demand(true),Some(false),"其他页面展开时仍应接收 Agent 提醒");
+    h.app.open=false;h.app.notification_bell_until=h.t+4.5;
+    assert_eq!(h.app.agent_demand(true),Some(false),"弹窗不能中断 Agent 监听");
+    h.app.settings.notifications=false;
+    assert_eq!(h.app.agent_demand(true),None);
+    h.app.settings.notifications=true;assert_eq!(h.app.agent_demand(false),None);
+}
+#[test]
+fn agent_notifications_handle_inventory_gaps_and_share_the_messenger_queue() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.notifications=true;h.app.settings.wechat_notifications=true;
+    let mut task=agent_capsule_sample(Source::Dsh,AgentState::Working,"gap-question","确认项目");
+    h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+    h.app.receive_wechat_reminder();h.frame(vec![]);
+    task.state=AgentState::Waiting;task.activity_ms+=100;
+    h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);h.frame(vec![]);
+    assert_eq!(h.app.notice.as_ref().unwrap().title,"微信");
+    assert_eq!(h.app.alerts.len(),1,"Agent 提醒应排队，不覆盖微信弹窗");
+    for _ in 0..280 {h.frame(vec![]);}
+    assert!(h.app.notice.as_ref().unwrap().title.contains("需要确认"));
+    h.click_text("关闭");h.cursor=None;
+    h.app.ai.receive(Update::default(),h.t);h.frame(vec![]);
+    h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);h.frame(vec![]);
+    assert!(h.app.notice.is_none(),"列表短暂缺项后不能重播同一个询问");
+    let mut subagent=task.clone();subagent.id="child".into();subagent.subagent=true;
+    h.app.ai.receive(Update{recent:vec![task,subagent],..Default::default()},h.t);h.frame(vec![]);
+    assert!(h.app.notice.is_none(),"子 Agent 不单独弹出询问");
+}
+#[test]
+fn agent_notifications_keep_a_right_badge_after_the_popup_until_viewed() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for source in [Source::Codex,Source::Dsh] {for state in [AgentState::Completed,AgentState::Waiting] {
+        let mut h=H::new();h.app.settings.notifications=true;
+        let mut task=agent_capsule_sample(source,AgentState::Working,"unread","提醒项目");
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        task.state=state;task.activity_ms+=100;
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        for _ in 0..360 {h.frame(vec![]);}
+        assert!(h.app.notice.is_none());
+        let id=egui::Id::new(("card",true,("agent-unread",source.label(),"unread")));
+        let badge=h.ctx.read_response(id).expect("弹窗结束后 Agent 应保留右侧提醒图标").rect;
+        assert!(badge.left()>WIN_W/2.,"提醒图标应在岛的右侧");
+        assert!(h.notice_hit.is_some_and(|r|r.contains(badge.center())),"右侧提醒必须在通知命中区域内");
+        h.hover(badge.center(),0.65);h.click(badge.center());
+        assert!(h.cmds.contains(&crate::app::Cmd::AgentReturn(source)),"查看 {source:?} {state:?} 提醒");
+        h.frame(vec![]);h.frame(vec![]);assert!(h.app.pending_agents.is_empty(),"查看后应清除提醒图标");
+        h.app.ai.receive(Update{recent:vec![task],..Default::default()},h.t);h.frame(vec![]);
+        assert!(h.ctx.read_response(id).is_none(),"重复快照不能恢复已查看的提醒");
+    }}
+}
+#[test]
+fn agent_notifications_share_the_unread_capsule_in_all_docks() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for dock in [crate::model::Dock::Top,crate::model::Dock::Left,crate::model::Dock::Right] {
+        let mut h=H::new();h.app.settings.dock=dock;h.app.settings.notifications=true;h.app.settings.wechat_notifications=true;
+        h.app.receive_wechat_reminder();
+        let mut task=agent_capsule_sample(Source::Codex,AgentState::Working,"shared","共享提醒");
+        h.app.ai.receive(Update{recent:vec![task.clone()],..Default::default()},h.t);
+        task.state=AgentState::Completed;task.activity_ms+=100;
+        h.app.ai.receive(Update{recent:vec![task],..Default::default()},h.t);
+        for _ in 0..720 {h.frame(vec![]);}
+        let stack=h.ctx.read_response(egui::Id::new(("card",true,"messenger-stack"))).expect("Agent 与微信应共用未读入口").rect;
+        h.click(stack.center());for _ in 0..90 {h.frame(vec![]);}
+        assert!(h.app.open,"{dock:?} 共享未读入口应能展开");
+        let wechat=h.ctx.read_response(egui::Id::new(("card",true,"微信"))).unwrap().rect;
+        let agent=h.ctx.read_response(egui::Id::new(("card",true,("agent-unread","Codex","shared")))).unwrap().rect;
+        assert!((agent.center().x-wechat.center().x).abs()<0.1&&agent.top()>=wechat.bottom()-0.1,"共享胶囊应竖排且互不重叠");
+        h.click(agent.center());assert!(h.cmds.contains(&crate::app::Cmd::AgentReturn(Source::Codex)));
+        assert!(h.app.pending_agents.is_empty());assert_eq!(h.app.pending_messengers.len(),1,"查看 Agent 不清除微信未读");
+    }
+}
+#[test]
+fn agent_notifications_switches_are_independent_and_persisted() {
+    use crate::agent_sessions::{AgentState,Config,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for enabled in [Source::Codex,Source::Dsh] {
+        let mut h=H::new();h.app.settings.notifications=true;
+        h.app.ai.config=serde_json::from_value(serde_json::json!({"codex_notifications":enabled==Source::Codex,"dsh_notifications":enabled==Source::Dsh})).unwrap();
+        h.app.ai.config.save();let loaded=serde_json::to_value(Config::load()).unwrap();
+        assert_eq!(loaded["codex_notifications"],enabled==Source::Codex);
+        assert_eq!(loaded["dsh_notifications"],enabled==Source::Dsh);
+        let mut tasks:Vec<_>=[Source::Codex,Source::Dsh].into_iter().map(|s|agent_capsule_sample(s,AgentState::Working,s.label(),s.label())).collect();
+        h.app.ai.receive(Update{recent:tasks.clone(),..Default::default()},h.t);
+        for task in &mut tasks {task.state=AgentState::Waiting;task.activity_ms+=100;}
+        h.app.ai.receive(Update{recent:tasks,..Default::default()},h.t);h.frame(vec![]);
+        assert!(h.app.notice.as_ref().unwrap().title.starts_with(enabled.label()));
+        assert!(h.app.alerts.is_empty(),"被关闭来源的通知不能进入队列");
+    }
+}
+#[test]
+fn agent_settings_have_source_masters_and_no_capsule_or_global_session_switch() {
+    use crate::agent_sessions::{AgentState,Config,Source};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.settings.agent_capsule=true;
+    fn draw(h:&mut H,events:Vec<egui::Event>)->egui::FullOutput {
+        h.t+=0.03;
+        h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(690.,1800.))),time:Some(h.t),events,..Default::default()},|ctx|{
+            egui::CentralPanel::default().show(ctx,|ui|h.app.ai_settings(ui));
+        })
+    }
+    let output=draw(&mut h,vec![]);let labels=agent_capsule_text(&output);
+    assert!(!labels.iter().any(|s|s=="Agent 状态胶囊"||s=="Agent 会话"),"AI 页应改为各来源独立总开关");
+    for source in [Source::Codex,Source::Dsh] {
+        h.app.ai.config.codex_enabled=true;h.app.ai.config.dsh_enabled=true;draw(&mut h,vec![]);
+        let id=egui::Id::new(("agent-source-switch",source.label(),"enabled"));
+        let target=h.ctx.read_response(id).expect("每个 Agent 必须提供总开关").rect.center();
+        for pressed in [true,false] {draw(&mut h,vec![egui::Event::PointerMoved(target),egui::Event::PointerButton{pos:target,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
+        let loaded=Config::load();
+        assert_eq!(loaded.codex_enabled,source!=Source::Codex);assert_eq!(loaded.dsh_enabled,source!=Source::Dsh);
+        h.app.ai.recent=vec![agent_capsule_sample(Source::Codex,AgentState::Working,"codex","Codex项目"),agent_capsule_sample(Source::Dsh,AgentState::Working,"dsh","DSH项目")];
+        let text=agent_capsule_text(&agent_capsule_output(&mut h,false,vec![]));
+        assert_eq!(text,if source==Source::Codex {vec!["DSH项目"]}else{vec!["Codex项目"]},"胶囊只显示开启的来源");
+    }
+}
+#[test]
+fn agent_capsule_width_tracks_actual_project_text() {
+    use crate::agent_sessions::{AgentState,Source};use crate::bar_layout::AGENT;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings.agent_capsule=true;
+    for font in ["Segoe UI","微软雅黑","等线"] {for ppp in [1.,1.5,2.] {
+        crate::theme::load_font_choice(&h.ctx,font);h.ctx.set_pixels_per_point(ppp);
+        for project in ["建木","win-island-rust","iiiiiiiiii","WWWWWWWWWW","制造系统-01"] {
+            h.app.ai.snapshot=Some(agent_capsule_sample(Source::Codex,AgentState::Working,"project",project));
+            let output=agent_capsule_output(&mut h,false,vec![]);
+            let text_width=output.shapes.iter().find_map(|s|match &s.shape{egui::Shape::Text(t)if t.galley.text()==project=>Some(t.galley.size().x),_=>None}).expect("项目名应完整显示");
+            let width=h.app.capsule_layout_for_preview(&h.ctx).widths[AGENT];
+            let expected=35.+text_width.ceil()+27.+8.;
+            assert!((width-expected).abs()<=1.,"{font}/{ppp} 的 {project} 应按文字宽度排布：实际 {width}，预期 {expected}");
+        }
+    }}
+}
+#[test]
+fn agent_capsule_keeps_longest_running_project_until_it_finishes() {
+    use crate::agent_sessions::{AgentState,Source,Update};use crate::bar_layout::AGENT;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings.agent_capsule=true;h.app.ai.config.dsh_enabled=false;
+    let mut long=agent_capsule_sample(Source::Codex,AgentState::Working,"long","制造系统集成文档");
+    let mut short=agent_capsule_sample(Source::Codex,AgentState::Working,"short","建木");short.activity_ms+=100;
+    let mut ignored=agent_capsule_sample(Source::Codex,AgentState::Completed,"ignored","已经结束的特别特别长的项目名称");
+    let mut subagent=ignored.clone();subagent.id="subagent".into();subagent.state=AgentState::Working;subagent.subagent=true;
+    let mut stale=ignored.clone();stale.id="stale".into();stale.state=AgentState::Working;stale.updated_at-=180;
+    h.app.ai.receive(Update{selected:Some(short.clone()),recent:vec![short.clone(),long.clone(),ignored.clone(),subagent.clone(),stale.clone()],..Default::default()},h.t);
+    let output=agent_capsule_output(&mut h,false,vec![]);assert_eq!(agent_capsule_text(&output),["建木"]);
+    let expected=h.ctx.fonts(|fonts|35.+fonts.layout_no_wrap(long.project.clone(),crate::theme::font(10.,crate::theme::W::Semibold),egui::Color32::WHITE).size().x.ceil());
+    let held=h.app.capsule_layout_for_preview(&h.ctx).widths[AGENT];
+    assert!((held-expected).abs()<=1.,"切到短项目时，应保留仍在运行的长项目宽度：{held} / {expected}");
+    long.state=AgentState::Completed;ignored.activity_ms=0;
+    h.app.ai.receive(Update{selected:Some(short.clone()),recent:vec![short,long,ignored,subagent,stale],..Default::default()},h.t);
+    assert_eq!(h.app.capsule_layout_for_preview(&h.ctx).widths[AGENT],held,"完成提示期间保留项目名空间");
+    h.t+=6.1;h.app.t=h.t;
+    assert!(h.app.capsule_layout_for_preview(&h.ctx).widths[AGENT]<held-30.,"长任务提示结束后应收回空白");
+}
+#[test]
+fn agent_capsule_sources_keep_individual_project_widths() {
+    use crate::agent_sessions::{AgentState,Source,Update};use crate::bar_layout::AGENT;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();h.app.settings.agent_capsule=true;
+    let codex=agent_capsule_sample(Source::Codex,AgentState::Working,"codex","建木");
+    let dsh=agent_capsule_sample(Source::Dsh,AgentState::Thinking,"dsh","win-island-rust-session-monitor");
+    h.app.ai.receive(Update{selected:Some(codex.clone()),recent:vec![codex,dsh],..Default::default()},h.t);
+    let output=agent_capsule_output(&mut h,false,vec![]);
+    assert_eq!(agent_capsule_text(&output),["建木","win-island-rust-session-monitor"],"有空间时应保留完整的长项目名");
+    let texts:Vec<_>=output.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t),_=>None}).collect();
+    let expected_gap=35.+texts[0].galley.size().x.ceil()+8.;
+    assert!((texts[1].pos.x-texts[0].pos.x-expected_gap).abs()<=1.,"短项目后不应留固定宽度空白");
+    let expected=70.+texts.iter().map(|t|t.galley.size().x.ceil()).sum::<f32>()+8.;
+    assert!((h.app.capsule_layout_for_preview(&h.ctx).widths[AGENT]-expected).abs()<=1.);
+    for width in [62.,72.,120.,200.] {
+        let output=agent_capsule_output_at_width(&mut h,false,vec![],width);
+        for shape in &output.shapes {if let egui::Shape::Text(t)=&shape.shape {
+            assert!(t.pos.x>=250.-width/2. && t.pos.x+t.galley.size().x<=250.+width/2.+0.5,"空间受限时文字也必须留在组件内：{width} / {:?}",t.galley.text());
+        }}
+    }
 }
 #[test]
 fn agent_capsule_shows_both_sources_and_selects_the_clicked_session() {
@@ -65,6 +338,95 @@ fn agent_capsule_completion_grace_is_independent_for_each_source() {
     h.t+=6.1;let text=agent_capsule_text(&agent_capsule_output(&mut h,false,vec![]));
     assert!(!text.iter().any(|s|s.contains("灵动岛")));assert!(text.iter().any(|s|s.contains("制造系统")));
 }
+fn agent_capsule_has_completion(output:&egui::FullOutput)->bool {
+    output.shapes.iter().any(|s|matches!(&s.shape,egui::Shape::Circle(c)if c.radius>=4.&&c.fill==egui::Color32::from_rgb(86,212,155)))
+}
+#[test]
+fn agent_capsule_completion_takes_priority_over_other_running_sessions() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for source in [Source::Codex,Source::Dsh] {
+        let mut h=H::new();h.app.ai.config.codex_enabled=source==Source::Codex;h.app.ai.config.dsh_enabled=source==Source::Dsh;
+        let running=agent_capsule_sample(source,AgentState::Working,"running","其他任务");
+        let mut done=agent_capsule_sample(source,AgentState::Working,"done","刚完成的项目");done.activity_ms+=100;
+        h.app.ai.receive(Update{selected:Some(done.clone()),recent:vec![done.clone(),running.clone()],..Default::default()},h.t);
+        done.state=AgentState::Completed;done.activity_ms+=100;done.ended_at=Some(done.updated_at);
+        h.app.ai.receive(Update{selected:Some(done.clone()),recent:vec![done,running],..Default::default()},h.t);
+        let output=agent_capsule_output(&mut h,false,vec![]);
+        assert!(agent_capsule_has_completion(&output),"{source:?} 的完成提示不能被其他运行任务盖过");
+        assert_eq!(agent_capsule_text(&output),["刚完成的项目"]);
+        assert!(agent_capsule_has_completion(&agent_capsule_output(&mut h,true,vec![])),"侧边停靠也应显示完成图标");
+        h.t+=6.1;let output=agent_capsule_output(&mut h,false,vec![]);
+        assert!(!agent_capsule_has_completion(&output));assert_eq!(agent_capsule_text(&output),["其他任务"],"提示结束后恢复运行任务");
+    }
+}
+#[test]
+fn agent_capsule_completion_after_long_silence_is_still_shown() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let mut task=agent_capsule_sample(Source::Codex,AgentState::Working,"quiet","长任务");task.updated_at-=180;task.activity_ms-=180000;
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    assert!(agent_capsule_text(&agent_capsule_output(&mut h,false,vec![])).is_empty());
+    task.state=AgentState::Completed;task.updated_at+=180;task.activity_ms+=180000;task.ended_at=Some(task.updated_at);
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task],..Default::default()},h.t);
+    assert!(agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])),"运行图标因超时回到空闲，也不能漏掉真实结束事件");
+}
+#[test]
+fn agent_capsule_completion_survives_inventory_gaps_without_extending_deadline() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let mut task=agent_capsule_sample(Source::Codex,AgentState::Working,"gap","完成项目");
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    task.state=AgentState::Completed;task.ended_at=Some(task.updated_at);
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    let _=agent_capsule_output(&mut h,false,vec![]);
+    h.app.ai.receive(Update::default(),h.t);
+    let output=agent_capsule_output(&mut h,false,vec![]);
+    assert!(agent_capsule_has_completion(&output),"列表短暂缺项不能撤销已收到的完成提示");assert_eq!(agent_capsule_text(&output),["完成项目"]);
+    h.t+=4.;h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    assert!(agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])));
+    h.t+=2.1;h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task],..Default::default()},h.t);
+    assert!(!agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])),"重复快照不能不断延长完成提示");
+}
+#[test]
+fn agent_capsule_completion_between_polls_is_shown_without_replaying_history() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let mut task=agent_capsule_sample(Source::Codex,AgentState::Completed,"fast","短任务");task.turn_id="old".into();task.ended_at=Some(task.updated_at-20);task.activity_ms-=20000;
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    assert!(!agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])),"冷启动不重播历史完成状态");
+    task.turn_id="new".into();task.ended_at=Some(task.updated_at);task.activity_ms+=20000;
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    assert!(agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])),"两次采样之间完成的新一轮也应显示勾选");
+    h.t+=6.1;task.activity_ms+=1000;
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task],..Default::default()},h.t);
+    assert!(!agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])),"同一轮结束后的镜像更新不能重播提示");
+}
+#[test]
+fn agent_capsule_completion_is_cleared_when_the_same_session_starts_again() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let mut task=agent_capsule_sample(Source::Codex,AgentState::Working,"again","继续执行");
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    task.state=AgentState::Completed;task.ended_at=Some(task.updated_at);
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    assert!(agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])));
+    task.state=AgentState::Working;task.turn_id="next".into();task.ended_at=None;task.activity_ms+=100;
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task],..Default::default()},h.t);
+    let output=agent_capsule_output(&mut h,false,vec![]);
+    assert!(!agent_capsule_has_completion(&output),"同一会话开始下一轮时应立即恢复运行图标");assert_eq!(agent_capsule_text(&output),["继续执行"]);
+}
+#[test]
+fn agent_capsule_completion_uses_the_newest_snapshot_when_reads_overlap() {
+    use crate::agent_sessions::{AgentState,Source,Update};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    let task=agent_capsule_sample(Source::Codex,AgentState::Working,"overlap","同一会话");
+    h.app.ai.receive(Update{selected:Some(task.clone()),recent:vec![task.clone()],..Default::default()},h.t);
+    let mut done=task.clone();done.state=AgentState::Completed;done.activity_ms+=100;done.ended_at=Some(done.updated_at);
+    let mut next=task;next.turn_id="next".into();next.activity_ms+=200;
+    h.app.ai.receive(Update{selected:Some(done),recent:vec![next],..Default::default()},h.t);
+    assert!(!agent_capsule_has_completion(&agent_capsule_output(&mut h,false,vec![])),"列表已进入下一轮时，旧正文快照不能重新显示完成勾选");
+}
 #[test]
 fn agent_capsule_ignores_stale_work_but_keeps_pending_approval() {
     use crate::agent_sessions::{AgentState,Source,Update};
@@ -85,14 +447,15 @@ fn agent_capsule_switch_is_persisted_and_independent_of_quota() {
     h.app.ai.snapshot=Some(agent_capsule_sample(Source::Codex,AgentState::Working,"codex","灵动岛"));
     h.app.quota.config.enabled=true;h.app.quota.config.compact=true;
     h.app.quota.config.accounts.push(crate::quota::Account{id:"codex".into(),provider:crate::quota::Provider::Codex,alias:"额度".into(),source:"test.json".into(),slot:None,enabled:true,pinned:true});
+    let _=agent_capsule_output(&mut h,false,vec![]);
     let dir=crate::model::config_dir();std::fs::create_dir_all(&dir).unwrap();
     for agent in [false,true] {for quota in [false,true] {
         std::fs::write(dir.join("settings.txt"),format!("agent_capsule={}\ncapsule_pages=000000{}000\n",agent as u8,quota as u8)).unwrap();
         h.app.settings=crate::model::Settings::load();
         assert_eq!(h.app.ai_capsule_chip(),agent,"Agent 开关必须独立于额度");
         assert_eq!(h.app.quota_bar_indices().len(),quota as usize,"额度不能被 Agent 替换");
-        assert_eq!(h.app.agent_demand(true),agent.then_some(false));
-        let layout=h.app.capsule_layout_for_preview();
+        assert_eq!(h.app.agent_demand(true),Some(false),"独立通知仍需摘要监听");
+        let layout=h.app.capsule_layout_for_preview(&h.ctx);
         assert_eq!(layout.x[crate::bar_layout::AGENT].is_some(),agent);
         assert_eq!(layout.x[crate::bar_layout::QUOTA].is_some(),quota);
         h.app.settings.save();
@@ -101,7 +464,7 @@ fn agent_capsule_switch_is_persisted_and_independent_of_quota() {
 }
 
 #[test]
-fn agent_capsule_settings_switch_works_in_ai_and_page_management() {
+fn agent_capsule_settings_switch_works_in_page_management() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
     h.app.open_settings();h.ctx.set_embed_viewports(false);
     fn draw(h:&mut H,events:Vec<egui::Event>)->Pos2 {
@@ -114,7 +477,7 @@ fn agent_capsule_settings_switch_works_in_ai_and_page_management() {
         let _=h.ctx.run(egui::RawInput::default(),|ctx|h.app.settings_ui(ctx,false));
         let point=result.lock().unwrap().expect("设置页必须提供独立 Agent 开关");point
     }
-    for tab in [10,11] {
+    for tab in [10] {
         h.app.settings_tab=tab;h.app.settings.agent_capsule=false;
         let quota=h.app.capsule_enabled(6);let sources=h.app.ai.config.clone();let target=draw(&mut h,vec![]);
         for pressed in [true,false] {draw(&mut h,vec![egui::Event::PointerMoved(target),egui::Event::PointerButton{pos:target,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
@@ -133,16 +496,18 @@ fn agent_capsule_dual_layout_fits_with_quota_and_respects_source_switches() {
     let codex=agent_capsule_sample(Source::Codex,AgentState::Working,"codex","灵动岛");
     let dsh=agent_capsule_sample(Source::Dsh,AgentState::Thinking,"dsh","制造系统");
     h.app.ai.receive(Update{selected:Some(codex.clone()),recent:vec![codex.clone(),dsh.clone()],..Default::default()},h.t);
-    let mut layout=h.app.capsule_layout_for_preview();layout.widen_clock(40.);
+    let _=agent_capsule_output(&mut h,false,vec![]);
+    let mut layout=h.app.capsule_layout_for_preview(&h.ctx);layout.widen_clock(40.);
     let mut boxes:Vec<_>=layout.x.iter().enumerate().filter_map(|(i,x)|x.map(|x|{let w=layout.widths[i]+if i==bar::CLOCK{40.}else{0.};(x-w/2.,x+w/2.)})).collect();boxes.sort_by(|a,b|a.0.total_cmp(&b.0));
     assert!(boxes.windows(2).all(|p|p[1].0-p[0].1>=6.9));
     let fit=((WIN_W-32.)/layout.width).min(1.);
     assert!(boxes.first().unwrap().0*fit>=-(WIN_W-32.)/2. && boxes.last().unwrap().1*fit<=(WIN_W-32.)/2.);
-    assert!(layout.widths[bar::AGENT]>160.);
+    let both_width=layout.widths[bar::AGENT];
+    assert!(both_width>62. && both_width<160.,"两个短项目也应按实际文字宽度收缩");
     assert!(h.app.side_items().iter().any(|s|matches!(s,crate::side_dock::SideItem::Ai(height)if *height==64.)));
     h.app.ai.config.dsh_enabled=false;
     assert!(!agent_capsule_text(&agent_capsule_output(&mut h,false,vec![])).iter().any(|s|s.contains("制造系统")));
-    assert!(h.app.capsule_layout_for_preview().widths[bar::AGENT]<=160.);
+    assert!(h.app.capsule_layout_for_preview(&h.ctx).widths[bar::AGENT]<both_width);
     h.app.ai.config.codex_enabled=false;assert!(!h.app.ai_capsule_chip());assert_eq!(h.app.agent_demand(true),None);
 }
 
@@ -178,6 +543,7 @@ fn dsh_session_reuses_ai_page_and_exposes_waiting_source_and_metrics(){
 #[test]
 fn ai_page_routes_sessions_and_quota_independently_and_releases_body() {
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());let mut h=H::new();
+    h.app.ai.config.codex_notifications=false;h.app.ai.config.dsh_notifications=false;
     assert_eq!(crate::app::PAGE_NAMES[6],"AI");
     for page in crate::feature_config::FEATURE_PAGES {h.app.set_capsule_enabled(page,false);}
     h.app.open=true;h.app.page=6;h.app.ai.config.quota_tab=false;h.app.quota.config.enabled=false;
@@ -344,6 +710,358 @@ fn monitor_preview_is_read_only_and_colors_follow_the_selected_palette() {
     let labels:Vec<_>=out.shapes.iter().filter_map(|s|match &s.shape{egui::Shape::Text(t)=>Some(t.galley.text()),_=>None}).collect();
     assert!(labels.contains(&"37%")&&labels.contains(&"50%")&&labels.contains(&"GPU")&&labels.contains(&"—"));
     assert_eq!(h.app.page,page);assert_eq!(format!("{:?}",h.app.settings),settings);assert_eq!(h.app.pending.len(),queue);
+}
+
+fn monitor_reading_output(h: &mut H, expanded: bool) -> egui::FullOutput {
+    h.ctx.run(egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(600., 400.))), ..Default::default() }, |ctx| {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if expanded { h.app.feature_page_preview(ui, 9); }
+            else {
+                let card = crate::paint::Card::new(ui, Pos2::new(300., 60.), ui.clip_rect()).ghost();
+                h.app.draw_monitor_compact(&card, 0., 0.);
+            }
+        });
+    })
+}
+
+#[test]
+fn monitor_reading_switches_hide_only_the_selected_expanded_items() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()); let mut h = H::new();
+    h.app.settings.monitor = serde_json::from_value(serde_json::json!({
+        "show_cpu":false,"show_memory":false,"show_gpu":true,"show_download":false,
+        "show_upload":true,"show_storage":false,"show_processes":false
+    })).unwrap();
+    h.app.monitor.sample = crate::system_monitor::Sample { cpu:Some(37.),gpu:Some(73.),
+        memory_total:Some(16<<30),memory_used:Some(8<<30),download:Some(2.*1_048_576.),upload:Some(4096.),..Default::default() };
+    let output = monitor_reading_output(&mut h, true); let labels = agent_capsule_text(&output);
+    assert!(labels.iter().any(|s|s=="GPU") && labels.iter().any(|s|s=="73%"));
+    assert!(!labels.iter().any(|s|s=="CPU"||s=="内存"||s=="37%"||s=="50%"||s.contains("2.0 MB/s")), "关闭的读数不能留在展开页：{labels:?}");
+    assert!(labels.iter().any(|s|s.contains("4 KB/s")), "上传开关独立于下载：{labels:?}");
+}
+
+#[test]
+fn monitor_capsule_uses_its_own_reading_switches_and_keeps_preview_read_only() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner()); let mut h = H::new();
+    h.app.settings.monitor = serde_json::from_value(serde_json::json!({
+        "show_gpu":false,"show_download":false,"capsule_readings":[false,false,true,true,false,false]
+    })).unwrap();
+    h.app.monitor.sample = crate::system_monitor::Sample { cpu:Some(37.),gpu:Some(73.),download:Some(2.*1_048_576.),..Default::default() };
+    let before = format!("{:?}",h.app.settings); let page=h.app.page; let queued=h.app.pending.len();
+    let output = monitor_reading_output(&mut h, false); let labels = agent_capsule_text(&output);
+    assert!(labels.iter().any(|s|s=="73%") && labels.iter().any(|s|s.contains("2.0 MB/s")), "胶囊应显示独立选中的 GPU 和下载：{labels:?}");
+    assert!(!labels.iter().any(|s|s=="37%"||s=="C"||s=="M"));
+    assert_eq!(format!("{:?}",h.app.settings),before); assert_eq!(h.app.page,page); assert_eq!(h.app.pending.len(),queued);
+}
+
+fn monitor_capsule_bounds(output:&egui::FullOutput, color:egui::Color32)->Rect {
+    output.shapes.iter().filter_map(|shape| {
+        let matches=match &shape.shape {
+            egui::Shape::Rect(rect)=>rect.stroke.color==color,
+            egui::Shape::LineSegment{stroke,..}=>stroke.color==color,
+            _=>false,
+        };
+        matches.then(||shape.shape.visual_bounding_rect())
+    }).fold(Rect::NOTHING,|bounds,rect|bounds.union(rect))
+}
+
+#[test]
+fn monitor_capsule_width_and_icons_stay_fixed_as_readings_change() {
+    use crate::{bar_layout::{CLOCK,MONITOR},system_monitor::{Reading,Sample}};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for font in ["Segoe UI","微软雅黑","等线"] {
+        let mut h=H::new();
+        crate::theme::load_font_choice(&h.ctx,font);
+        h.app.settings.appearance.font=font.into();
+        h.app.settings.monitor.capsule_readings=[true,true,false,true,true,false];
+        h.app.set_capsule_enabled(9,true);
+        let colors=h.app.settings.monitor.colors(&h.app.settings.appearance);
+        for pixels_per_point in [1.,1.25,1.5,2.] {
+            h.ctx.set_pixels_per_point(pixels_per_point);
+            let _=monitor_reading_output(&mut h,false);
+            let mut baseline:Option<Vec<f32>>=None;
+            for (cpu,memory,download,upload) in [
+                (None,None,None,None),
+                (Some(9.),Some(47),Some(14.*1024.),Some(11.*1024.)),
+                (Some(100.),Some(5),Some(999.49*1024.),Some(99.96*1_048_576.)),
+                (Some(1.),Some(99),Some(999.5*1024.),Some(999.5*1_048_576.)),
+            ] {
+                h.app.monitor.sample=Sample {cpu,memory_total:memory.map(|_|100),memory_used:memory,download,upload,..Default::default()};
+                let output=monitor_reading_output(&mut h,false);
+                let layout=h.app.capsule_layout_for_preview(&h.ctx);
+                let mut geometry=vec![layout.width,layout.widths[MONITOR],layout.x[CLOCK].unwrap(),layout.x[MONITOR].unwrap()];
+                let mut previous_text:Option<Rect>=None;
+                for reading in [Reading::Cpu,Reading::Memory,Reading::Download,Reading::Upload] {
+                    let icon=monitor_capsule_bounds(&output,colors[reading as usize]);
+                    let value=reading.value(&h.app.monitor.sample);
+                    let text=output.shapes.iter().filter_map(|shape|match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text()==value=>Some(text.visual_bounding_rect()),_=>None
+                    }).filter(|rect|rect.left()>icon.right()).min_by(|a,b|a.left().total_cmp(&b.left()))
+                      .unwrap_or_else(||panic!("{font}、{pixels_per_point} 倍缩放时应完整显示 {value}"));
+                    assert!(text.left()-icon.right()<8.,"{value} 应紧邻自己的图标");
+                    if let Some(previous)=previous_text {assert!(icon.left()>previous.right(),"{value} 不应覆盖上一项");}
+                    previous_text=Some(text);
+                    geometry.push(icon.left());
+                }
+                if let Some(before)=&baseline {
+                    for (old,new) in before.iter().zip(&geometry) {
+                        assert!((old-new).abs()<0.01,"{font}、{pixels_per_point} 倍缩放时，读数变化不能移动胶囊或图标：{before:?} -> {geometry:?}");
+                    }
+                } else {baseline=Some(geometry);}
+            }
+        }
+    }
+}
+
+#[test]
+fn monitor_capsule_remeasures_when_a_new_font_takes_effect() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    for font in ["微软雅黑","等线"] {for pixels_per_point in [1.,1.5,2.] {
+        let mut changing=H::new();
+        changing.ctx.set_pixels_per_point(pixels_per_point);
+        changing.app.settings.monitor.capsule_readings=[true,true,false,true,true,false];
+        changing.app.settings.appearance.font=font.into();
+        // 设置值可能先于 egui 的新字体生效一帧。
+        let _=monitor_reading_output(&mut changing,false);
+        crate::theme::load_font_choice(&changing.ctx,font);
+        let _=monitor_reading_output(&mut changing,false);
+        let width=changing.app.monitor_capsule_width(&changing.ctx);
+
+        let mut fresh=H::new();
+        fresh.ctx.set_pixels_per_point(pixels_per_point);
+        fresh.app.settings.monitor.capsule_readings=[true,true,false,true,true,false];
+        fresh.app.settings.appearance.font=font.into();
+        crate::theme::load_font_choice(&fresh.ctx,font);
+        let _=monitor_reading_output(&mut fresh,false);
+        let expected=fresh.app.monitor_capsule_width(&fresh.ctx);
+        assert!((width-expected).abs()<0.01,"{font}、{pixels_per_point} 倍缩放应用新字体后应重新测量：{width} / {expected}");
+    }}
+}
+
+#[test]
+fn monitor_capsule_keeps_short_readings_close_to_their_icons() {
+    use crate::bar_layout::MONITOR;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner()); let mut h=H::new();
+    h.app.settings.monitor.capsule_readings=[true,true,false,true,true,false];
+    h.app.set_capsule_enabled(9,true);
+    h.app.monitor.sample=crate::system_monitor::Sample {
+        cpu:Some(9.),memory_total:Some(100),memory_used:Some(47),
+        download:Some(14.*1024.),upload:Some(11.*1024.),..Default::default()
+    };
+    let output=monitor_reading_output(&mut h,false);
+    let colors=h.app.settings.monitor.colors(&h.app.settings.appearance);
+    let mut previous_text:Option<Rect>=None;
+    for (index,label) in [(0,"9%"),(1,"47%"),(3,"14 KB/s"),(4,"11 KB/s")] {
+        let icon=monitor_capsule_bounds(&output,colors[index]);
+        let text=output.shapes.iter().find_map(|s|match &s.shape {
+            egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect()),_=>None
+        }).expect("胶囊读数应完整显示");
+        let gap=text.left()-icon.right();
+        assert!((0.0..=8.0).contains(&gap),"{label} 与图标间距过大或重叠：{gap}");
+        if let Some(previous)=previous_text {
+            let gap=icon.left()-previous.right();
+            assert!((0.0..=30.0).contains(&gap),"{label} 与上一项间距过大或重叠：{gap}");
+        }
+        previous_text=Some(text);
+    }
+    let layout=h.app.capsule_layout_for_preview(&h.ctx);
+    assert!(layout.widths[MONITOR]<260.,"预留三位读数时也不应占用过宽空间：{}",layout.widths[MONITOR]);
+}
+
+#[test]
+fn monitor_capsule_keeps_long_readings_inside_its_real_slot_at_different_scales() {
+    use crate::bar_layout::MONITOR;
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner()); let mut h=H::new();
+    h.app.settings.monitor.capsule_readings=[true,true,false,true,true,false];
+    h.app.set_capsule_enabled(9,true);
+    h.app.monitor.sample=crate::system_monitor::Sample {
+        cpu:Some(100.),memory_total:Some(100),memory_used:Some(47),
+        download:Some(999.*1024.),upload:Some(999.*1_048_576.),..Default::default()
+    };
+    let colors=h.app.settings.monitor.colors(&h.app.settings.appearance);
+    for pixels_per_point in [1.,1.25,1.5,2.] {
+        h.ctx.set_pixels_per_point(pixels_per_point);
+        let _=monitor_reading_output(&mut h,false);
+        let width=h.app.capsule_layout_for_preview(&h.ctx).widths[MONITOR];
+        for scale in [0.7,0.8,1.,1.2,1.3,1.4] {
+            let output=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(600.,200.))),..Default::default()},|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| {
+                    let mut card=crate::paint::Card::new(ui,Pos2::new(300.,60.),ui.clip_rect()).ghost();
+                    card.s=scale;
+                    h.app.draw_monitor_compact(&card,0.,0.);
+                });
+            });
+            let mut previous_text:Option<Rect>=None;
+            for (index,label) in [(0,"100%"),(1,"47%"),(3,"999 KB/s"),(4,"999 MB/s")] {
+                let icon=monitor_capsule_bounds(&output,colors[index]);
+                let text=output.shapes.iter().find_map(|s|match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text()==label=>Some(t.visual_bounding_rect()),_=>None
+                }).unwrap_or_else(||panic!("像素比例 {pixels_per_point}、缩放 {scale} 时应完整显示 {label}，实际文字：{:?}",agent_capsule_text(&output)));
+                assert!(icon.left()>=300.-width*scale/2.-1. && text.right()<=300.+width*scale/2.+1.,"像素比例 {pixels_per_point}、缩放 {scale} 时 {label} 超出胶囊占位");
+                assert!(text.left()>icon.right(),"像素比例 {pixels_per_point}、缩放 {scale} 时 {label} 不能覆盖图标");
+                if let Some(previous)=previous_text {assert!(icon.left()>previous.right(),"像素比例 {pixels_per_point}、缩放 {scale} 时 {label} 不能覆盖上一项");}
+                previous_text=Some(text);
+            }
+        }
+    }
+}
+
+#[test]
+fn monitor_all_readings_off_stops_sampling_and_removes_capsule_slot() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner()); let mut h=H::new();
+    h.app.settings.monitor=serde_json::from_value(serde_json::json!({
+        "show_cpu":false,"show_memory":false,"show_gpu":false,"show_download":false,"show_upload":false,
+        "show_storage":false,"show_processes":false,"capsule_readings":[false,false,false,false,false,false]
+    })).unwrap();
+    h.app.set_capsule_enabled(9,true); h.app.set_page_visible(9,true); h.app.page=9; h.app.open=true;
+    assert!(!h.app.monitor_polling_needed(),"全部关闭后不应继续采样");
+    assert!(h.app.capsule_layout_for_preview(&h.ctx).x[crate::bar_layout::MONITOR].is_none(),"空监控胶囊不应占位");
+    h.app.open_settings(); h.app.settings_tab=13; h.ctx.set_embed_viewports(false);
+    let output=redesign_settings_frame(&mut h,800.,2000.,vec![]);
+    assert!(agent_capsule_text(&output).iter().any(|s|s.contains("未选择胶囊读数")),"空预览应说明如何开启读数");
+}
+
+#[test]
+fn monitor_settings_offer_icons_independent_switches_and_capsule_preview() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner()); let mut h=H::new();
+    h.app.open_settings(); h.app.settings_tab=13; h.ctx.set_embed_viewports(false);
+    let output=redesign_settings_frame(&mut h,800.,2200.,vec![]); let labels=agent_capsule_text(&output);
+    for label in ["胶囊预览","监控项目","胶囊态","展开态","CPU","内存","GPU","下载","上传","磁盘","进程列表"] {
+        assert!(labels.iter().any(|s|s==label),"系统监控设置缺少 {label}：{labels:?}");
+    }
+    let point=std::sync::Arc::new(Mutex::new(None)); let capture=point.clone();
+    egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport| {
+        let id=viewport.ids.this;
+        let _=ctx.run(egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(800.,2200.))),viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()},|ctx| {
+            (viewport.viewport_ui_cb)(ctx);
+            *capture.lock().unwrap()=ctx.read_response(egui::Id::new(("monitor-switch",0usize,"expanded"))).map(|r|r.rect.center());
+        });
+    });
+    let _=h.ctx.run(egui::RawInput::default(),|ctx|h.app.settings_ui(ctx,false));
+    let point=point.lock().unwrap().expect("CPU 展开态应有独立开关");
+    for pressed in [true,false] {let _=redesign_settings_frame(&mut h,800.,2200.,vec![egui::Event::PointerMoved(point),egui::Event::PointerButton{pos:point,button:egui::PointerButton::Primary,pressed,modifiers:Default::default()}]);}
+    let saved=serde_json::to_value(crate::model::Settings::load().monitor).unwrap();
+    assert_eq!(saved["show_cpu"],false); assert_eq!(saved["show_memory"],true);
+    assert_eq!(saved["capsule_readings"][0],true,"展开开关不能改动胶囊开关");
+}
+
+#[test]
+fn monitor_icons_are_distinct_visible_vectors_at_capsule_and_settings_sizes() {
+    use crate::system_monitor::Reading;
+    let ctx=egui::Context::default(); let color=egui::Color32::from_rgb(104,185,255);
+    for size in [11.,19.] {
+        let mut fingerprints=std::collections::HashSet::new();
+        for reading in Reading::ALL {
+            let output=ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(60.,60.))),..Default::default()},|ctx| {
+                egui::CentralPanel::default().show(ctx,|ui| {
+                    let card=crate::paint::Card::new(ui,Pos2::new(30.,30.),ui.clip_rect()).ghost();
+                    crate::monitor_ui::reading_icon(&card,reading,0.,0.,size,color);
+                });
+            });
+            fingerprints.insert(format!("{:?}",output.shapes));
+            let meshes=ctx.tessellate(output.shapes,output.pixels_per_point);
+            let points:Vec<_>=meshes.iter().flat_map(|primitive|match &primitive.primitive {
+                egui::epaint::Primitive::Mesh(mesh)=>mesh.vertices.iter().filter(|v|v.color.b()>100&&v.color.b()>v.color.g().saturating_add(10)&&v.color.g()>v.color.r().saturating_add(10)).map(|v|v.pos).collect::<Vec<_>>(),_=>vec![]
+            }).collect();
+            assert!(points.len()>8,"{reading:?} 的 {size}px 图标应可见");
+            assert!(points.iter().all(|p|Rect::from_center_size(Pos2::new(30.,30.),Vec2::splat(size+3.)).contains(*p)),"图标应位于分配范围内");
+        }
+        assert_eq!(fingerprints.len(),6,"各读数使用可区分的图标");
+    }
+}
+
+#[test]
+fn monitor_capsule_layout_side_dock_and_small_settings_follow_selected_readings() {
+    use crate::{bar_layout::MONITOR,side_dock::SideItem,system_monitor::Reading};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner()); let mut h=H::new();
+    let _=h.ctx.run(egui::RawInput::default(),|_|{});
+    h.app.set_capsule_enabled(9,true);
+    let mut widths=vec![];
+    for enabled in [0,1,2,6] {
+        h.app.settings.monitor.capsule_readings=[false;6];
+        for reading in Reading::ALL.into_iter().take(enabled) {h.app.settings.monitor.capsule_readings[reading as usize]=true;}
+        let layout=h.app.capsule_layout_for_preview(&h.ctx);
+        if enabled==0 {assert!(layout.x[MONITOR].is_none()); assert!(!h.app.side_items().iter().any(|i|matches!(i,SideItem::Monitor(_))));}
+        else {
+            widths.push(layout.widths[MONITOR]);
+            assert!(h.app.side_items().iter().any(|i|matches!(i,SideItem::Monitor(n)if *n==enabled)));
+            let x=layout.x[MONITOR].unwrap();
+            assert!(x+layout.widths[MONITOR]/2.<=layout.width/2.-15.9);
+            let sample=h.app.monitor_sampling_settings();
+            assert!(!sample.show_processes,"胶囊不采集进程列表");
+        }
+    }
+    assert!(widths.windows(2).all(|w|w[0]<w[1]),"胶囊宽度随选中项增加：{widths:?}");
+    h.app.settings_tab=13; h.app.open_settings(); h.ctx.set_embed_viewports(false);
+    for dock in [crate::model::Dock::Top,crate::model::Dock::Left,crate::model::Dock::Right] {
+        h.app.settings.dock=dock;
+        let output=redesign_settings_frame(&mut h,600.,2200.,vec![]);
+        let visible:Vec<_>=output.shapes.iter().filter_map(|s|match &s.shape {
+            egui::Shape::Text(t)if t.visual_bounding_rect().left()>185.&&s.clip_rect.contains(t.visual_bounding_rect().center())=>Some(t),_=>None
+        }).collect();
+        assert!(visible.iter().all(|t|t.visual_bounding_rect().right()<=600.5),"{dock:?} 窄设置窗口文本不应越界：{:?}",visible.iter().filter(|t|t.visual_bounding_rect().right()>600.5).map(|t|t.galley.text()).collect::<Vec<_>>());
+    }
+}
+
+#[test]
+fn monitor_capsule_leaves_room_for_a_running_agent_and_its_preview_shoulders() {
+    use crate::{agent_sessions::{AgentState,Source},bar_layout::{AGENT,MONITOR}};
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner()); let mut h=H::new();
+    h.app.set_capsule_enabled(9,true); h.app.settings.monitor.capsule_readings=[true;6];
+    h.app.settings.agent_capsule=true;
+    h.app.ai.snapshot=Some(agent_capsule_sample(Source::Codex,AgentState::Working,"monitor-agent","win-island-rust"));
+    let _=h.ctx.run(egui::RawInput::default(),|_|{});
+    let layout=h.app.capsule_layout_for_preview(&h.ctx);
+    assert!(layout.width<=WIN_W-16.,"全选监控时应给 Agent 留出宽度：{layout:?}");
+    let distance=(layout.x[MONITOR].unwrap()-layout.x[AGENT].unwrap()).abs();
+    assert!(distance>=(layout.widths[MONITOR]+layout.widths[AGENT])/2.+10.);
+    h.app.settings.island_shape=crate::model::IslandShape::Notch;
+    for dock in [crate::model::Dock::Top,crate::model::Dock::Left,crate::model::Dock::Right] {
+        h.app.settings.dock=dock;
+        let output=h.ctx.run(egui::RawInput{screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(380.,400.))),..Default::default()},|ctx| {
+            egui::CentralPanel::default().show(ctx,|ui|h.app.monitor_capsule_preview(ui));
+        });
+        let stage=output.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Rect(r)if r.fill==egui::Color32::from_rgb(19,25,36)=>Some(r.rect),_=>None}).unwrap();
+        let shell=output.shapes.iter().find_map(|s|match &s.shape {egui::Shape::Mesh(m)=>Some(m),_=>None}).unwrap();
+        assert!(shell.vertices.iter().all(|v|stage.expand(0.1).contains(v.pos)),"{dock:?} 的胶囊肩部不能超出预览底板");
+    }
+}
+
+#[test]
+#[ignore = "按需以 egui 软件光栅化导出系统监控设置，不连接浏览器"]
+fn monitor_controls_gallery() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let dest=std::path::PathBuf::from(std::env::var_os("ISLAND_MONITOR_PREVIEW_DIR").expect("需指定预览目录")); std::fs::create_dir_all(&dest).unwrap();
+    for (name,width,dark,side,all) in [("light",800.,false,false,false),("dark-all",800.,true,false,true),("narrow-all",600.,false,false,true),("side-all",800.,false,true,true)] {
+        let height=1600.; let mut h=H::new();h.app.settings_tab=13;h.app.open_settings();h.ctx.set_embed_viewports(false);
+        h.app.settings.settings_theme=if dark{crate::settings_theme::SettingsTheme::Dark}else{crate::settings_theme::SettingsTheme::Light};
+        h.app.settings.dock=if side{crate::model::Dock::Left}else{crate::model::Dock::Top};
+        if all{h.app.settings.monitor.capsule_readings=[true;6];}
+        h.app.monitor.sample=crate::system_monitor::Sample{cpu:Some(37.),gpu:Some(21.),memory_used:Some(8<<30),memory_total:Some(16<<30),download:Some(2.*1_048_576.),upload:Some(32.*1024.),
+            drives:vec![crate::system_monitor::Drive{name:"C:".into(),used:128<<30,total:256<<30},crate::system_monitor::Drive{name:"D:".into(),used:100<<30,total:512<<30}],
+            processes:vec![crate::system_monitor::Process{name:"示例应用.exe".into(),cpu:Some(5.),memory:180<<20,count:1}],..Default::default()};
+        for n in 0..60 {let mut sample=h.app.monitor.sample.clone();sample.cpu=Some(20.+(n as f64*0.3).sin()*15.);h.app.monitor.history.push(&sample);}
+        h.app.monitor.received=Some(std::time::Instant::now());
+        let demo=h.app.monitor.sample.clone();
+        let output=std::sync::Arc::new(Mutex::new(None));let capture=output.clone();
+        egui::Context::set_immediate_viewport_renderer(move|ctx,mut viewport| {
+            let id=viewport.ids.this;
+            *capture.lock().unwrap()=Some(ctx.run(egui::RawInput{viewport_id:id,screen_rect:Some(Rect::from_min_size(Pos2::ZERO,egui::vec2(width,height))),viewports:std::iter::once((id,egui::ViewportInfo::default())).collect(),..Default::default()},|ctx|(viewport.viewport_ui_cb)(ctx)));
+        });
+        let mut raster=crate::preview_raster::Raster::new(width as usize,height as usize);
+        for frame in 0..5 {
+            // 每帧使用固定示例，不让后台真实采样覆盖导出的演示内容。
+            h.app.monitor=crate::system_monitor::State::default();
+            h.app.monitor.sample=demo.clone();h.app.monitor.received=Some(std::time::Instant::now());
+            for n in 0..60 {let mut sample=demo.clone();sample.cpu=Some(20.+(n as f64*0.3).sin()*15.);h.app.monitor.history.push(&sample);}
+            let root=h.ctx.run(egui::RawInput::default(),|ctx|h.app.settings_ui(ctx,false));let child=output.lock().unwrap().take().unwrap();
+            raster.update_textures(&root.textures_delta);raster.update_textures(&child.textures_delta);
+            if frame==4 {
+                raster.buf.fill([0.,0.,0.,1.]);raster.draw(&h.ctx.tessellate(child.shapes,child.pixels_per_point),child.pixels_per_point);
+                let mut rgba=vec![];raster.to_rgba8(&mut rgba);image::save_buffer(dest.join(format!("monitor-{name}.png")),&rgba,width as u32,height as u32,image::ColorType::Rgba8).unwrap();
+            }
+            raster.free_textures(&root.textures_delta);raster.free_textures(&child.textures_delta);
+        }
+    }
 }
 
 fn redesign_settings_frame(h:&mut H,width:f32,height:f32,events:Vec<egui::Event>)->egui::FullOutput {
@@ -1084,6 +1802,7 @@ struct H {
     cmds:Vec<crate::app::Cmd>,
     region:Rect,
     hit:Rect,
+    notice_hit:Option<Rect>,
     animating:bool,
     shapes:Vec<egui::epaint::ClippedShape>,
     bt: Vec<crate::bt::Device>,
@@ -1103,7 +1822,7 @@ impl H {
         std::env::set_var("DAOZAI_DATA_DIR", &dir);
         let ctx = egui::Context::default();
         let app = App::new(&ctx, Options { fetch_lyrics: false, pet_idle: 1e9 });
-        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
+        Self { ctx, app, t: 0.0, cursor: None,cmds:vec![],region:Rect::NOTHING,hit:Rect::NOTHING,notice_hit:None,animating:false,shapes:Vec::new(), bt:Vec::new(),media:Default::default(),power:(None,false),network:None,system_idle:None,browser_at_top:None,file_drop_zone:None,hovered_files:vec![],dropped_files:vec![] }
     }
     fn frame(&mut self, events: Vec<egui::Event>) {
         self.t += 1.0 / 60.0;
@@ -1136,13 +1855,14 @@ impl H {
         let cmds=&mut self.cmds;
         let region=&mut self.region;
         let hit=&mut self.hit;
+        let notice_hit=&mut self.notice_hit;
         let animating=&mut self.animating;
         let app = &mut self.app;
         let file_drop_zone=&mut self.file_drop_zone;
         let output = self.ctx.run(raw, |ctx| {
             egui::CentralPanel::default().frame(egui::Frame::new()).show(ctx, |ui| {
                 let win = Rect::from_min_size(ui.max_rect().min,Vec2::new(WIN_W,WIN_H));
-                let frame=app.frame(ui, win, &env);*region=frame.region;*hit=frame.hit;*animating=frame.animating;*file_drop_zone=frame.file_drop_zone;cmds.extend(frame.cmds);
+                let frame=app.frame(ui, win, &env);*region=frame.region;*hit=frame.hit;*notice_hit=frame.notice_hit;*animating=frame.animating;*file_drop_zone=frame.file_drop_zone;cmds.extend(frame.cmds);
             });
         });
         self.shapes=output.shapes;
@@ -1935,6 +2655,103 @@ fn music_lyrics_respect_the_switch_and_do_not_show_stale_or_unsynced_lines() {
 }
 
 #[test]
+fn opening_after_idle_does_not_skip_the_start_of_the_animation() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.appearance.open_delay=0;
+    for _ in 0..90 {h.frame(vec![]);}
+    let before=h.app.progress();
+    h.t+=1.0;
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0/60.0);
+    assert!(h.app.open,"零延迟应立即接受展开意图");
+    assert!((h.app.progress()-before).abs()<0.03,"空闲时间不能推进刚触发的展开动画：{} -> {}",before,h.app.progress());
+    h.hover(Pos2::new(WIN_W/2.0,12.0),0.6);
+    assert!(h.app.progress()>0.98,"后续仍应完整展开");
+}
+
+#[test]
+fn opening_from_a_menu_after_idle_keeps_the_first_frame_continuous() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    for _ in 0..90 {h.frame(vec![]);}
+    let before=h.app.progress();
+    h.t+=1.0;
+    h.app.show_page(4);
+    h.frame(vec![]);
+    assert!((h.app.progress()-before).abs()<0.03,"菜单打开同样不能把此前空闲时间计入动画");
+    for _ in 0..40 {h.frame(vec![]);}
+    assert!(h.app.progress()>0.98);
+}
+
+#[test]
+fn reversing_the_island_does_not_jump_content_opacity() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.appearance.open_delay=0;
+    h.app.settings.appearance.close_delay=0;
+    for _ in 0..90 {h.frame(vec![]);}
+    h.cursor=Some(Pos2::new(WIN_W/2.0,12.0));
+    for _ in 0..60 {
+        h.frame(vec![]);
+        if (0.6..0.85).contains(&h.app.progress()){break;}
+    }
+    assert!((0.6..0.85).contains(&h.app.progress()));
+    let (position,opacity)=(h.app.progress(),h.app.reveal);
+    h.cursor=None;
+    h.t-=1.0/60.0;
+    h.frame(vec![]);
+    assert!(!h.app.open);
+    assert!((h.app.progress()-position).abs()<1e-5);
+    assert!((h.app.reveal-opacity).abs()<1e-5,"同一尺寸反向时内容应保持透明度：{opacity} -> {}",h.app.reveal);
+}
+
+#[test]
+fn returning_during_collapse_reopens_without_another_hover_delay() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.appearance.close_delay=0;
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.2);
+    h.cursor=None;
+    for _ in 0..60 {
+        h.frame(vec![]);
+        if h.app.progress()<0.6 {break;}
+    }
+    assert!(!h.app.open && h.app.progress()>0.3);
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.0/60.0);
+    assert!(h.app.open,"收起途中返回应直接接回展开，不再朝胶囊收缩并重复等待");
+}
+
+#[test]
+fn island_motion_matches_across_frame_rates_and_delay_boundaries() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut reference:Option<[(f32,f32,f32,f32);2]>=None;
+    for fps in [30,60,120] {
+        let mut h=H::new();
+        h.app.settings.appearance.open_delay=217;
+        h.app.settings.appearance.close_delay=73;
+        for _ in 0..90 {h.frame(vec![]);}
+        let mut samples=[(0.0,0.0,0.0,0.0);2];
+        for (index,opening) in [true,false].into_iter().enumerate() {
+            h.cursor=opening.then_some(Pos2::new(WIN_W/2.0,12.0));
+            h.frame(vec![]);
+            for _ in 0..fps*3/10 {
+                h.t+=1.0/f64::from(fps)-1.0/60.0;
+                h.frame(vec![]);
+            }
+            assert_eq!(h.app.open,opening);
+            samples[index]=(h.app.w.pos,h.app.h.pos,h.app.w.vel,h.app.h.vel);
+        }
+        if let Some(reference)=reference {
+            for (actual,expected) in samples.into_iter().zip(reference) {
+                for (actual,expected) in [actual.0,actual.1,actual.2,actual.3].into_iter().zip([expected.0,expected.1,expected.2,expected.3]) {
+                    assert!((actual-expected).abs()<0.02,"{fps} FPS 下跨越开合延迟边界也应保持相同轨迹和速度：{actual} / {expected}");
+                }
+            }
+        }else{reference=Some(samples);}
+    }
+}
+
+#[test]
 fn hover_expands_with_overshoot_and_leave_collapses() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut h = H::new();
@@ -1992,6 +2809,22 @@ fn browser_minimal_closes_the_open_island_but_still_allows_deliberate_hover(){
     assert!(!h.app.open,"短暂碰到刘海不能误触");
     h.hover(Pos2::new(WIN_W/2.0,2.0),0.6);
     assert!(h.app.open,"仍应能主动悬停打开岛");
+}
+
+#[test]
+fn browser_minimal_keeps_hover_delay_when_switching_during_collapse() {
+    let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());
+    let mut h=H::new();
+    h.app.settings.browser_minimal=true;
+    h.app.settings.appearance.close_delay=0;
+    h.hover(Pos2::new(WIN_W/2.0,12.0),1.2);
+    h.cursor=None;h.frame(vec![]);
+    assert!(!h.app.open && h.app.progress()>0.9);
+    h.browser_at_top=Some(true);h.frame(vec![]);
+    h.hover(Pos2::new(WIN_W/2.0,2.0),0.25);
+    assert!(!h.app.open,"切换到浏览器必须取消收起途中的快速接回，保留刘海防误触");
+    h.hover(Pos2::new(WIN_W/2.0,2.0),0.6);
+    assert!(h.app.open);
 }
 
 #[test]
@@ -5670,7 +6503,7 @@ fn side_dock_stacks_ai_quota_and_opens_the_account(){
     let total=h.app.side_bar_len()-14.0;
     let mut y=top+(h.app.h.pos-total)/2.0;
     for item in h.app.side_items() {
-        let height=match item {crate::side_dock::SideItem::Quota(i,hh) if h.app.quota.config.accounts[i].id==wb=>{y+=hh/2.0;break;},crate::side_dock::SideItem::Quota(_,hh)=>hh,crate::side_dock::SideItem::Ai(hh)=>hh,crate::side_dock::SideItem::Clock=>32.0,crate::side_dock::SideItem::Battery=>20.0,crate::side_dock::SideItem::Music=>18.0,crate::side_dock::SideItem::Focus|crate::side_dock::SideItem::Bell=>22.0,crate::side_dock::SideItem::Weather=>34.0,crate::side_dock::SideItem::Feature(_)=>24.0};
+        let height=match item {crate::side_dock::SideItem::Quota(i,hh) if h.app.quota.config.accounts[i].id==wb=>{y+=hh/2.0;break;},other=>other.height()};
         y+=height;
     }
     let click=Pos2::new(18.0,y);
@@ -6678,11 +7511,11 @@ fn new_capsule_features_follow_switches_and_preview_layout() {
     for page in [3,4,5,7] {h.app.set_capsule_enabled(page,true);}
     h.frame(vec![]);
     for slot in [CLIPBOARD,TODO,MAIL,CALENDAR] {assert!(h.app.resident.current().x[slot].is_some());}
-    let state=h.app.capsule_layout_for_preview();
+    let state=h.app.capsule_layout_for_preview(&h.ctx);
     for slot in [CLIPBOARD,TODO,MAIL,CALENDAR] {assert!(state.x[slot].is_some());}
     h.app.set_capsule_enabled(4,false);h.frame(vec![]);
     assert!(h.app.resident.current().x[TODO].is_none());
-    assert!(h.app.capsule_layout_for_preview().x[TODO].is_none());
+    assert!(h.app.capsule_layout_for_preview(&h.ctx).x[TODO].is_none());
 }
 
 #[test]
@@ -6721,7 +7554,7 @@ fn feature_settings_show_preview_without_duplicate_management_switches() {
     for tab in [1,2,4,5,7,8,11,12,13] {
         let text=draw(&mut h,tab);
         assert!(text.iter().any(|item|item=="功能预览"),"设置页 {tab} 缺少功能预览: {text:?}");
-        for label in ["胶囊态","展开态"] {assert!(!text.iter().any(|item|item==label),"设置页 {tab} 不应重复显示 {label}: {text:?}");}
+        if tab != 13 {for label in ["胶囊态","展开态"] {assert!(!text.iter().any(|item|item==label),"设置页 {tab} 不应重复显示 {label}: {text:?}");}}
     }
     let management=draw(&mut h,10);
     for label in ["功能显示","胶囊态","展开态"] {assert!(management.iter().any(|item|item==label),"页面管理缺少 {label}: {management:?}");}
@@ -6852,7 +7685,7 @@ fn page_management_switches_update_both_modes_and_capsule_preview() {
     let _=draw(&mut h,vec![egui::Event::PointerMoved(capsule)]);
     for pressed in [true,false] {let _=draw(&mut h,vec![button(capsule,pressed)]);}
     assert!(h.app.capsule_enabled(4));
-    assert!(h.app.capsule_layout_for_preview().x[crate::bar_layout::TODO].is_some());
+    assert!(h.app.capsule_layout_for_preview(&h.ctx).x[crate::bar_layout::TODO].is_some());
     let _=draw(&mut h,vec![egui::Event::PointerMoved(expanded)]);
     for pressed in [true,false] {let _=draw(&mut h,vec![button(expanded,pressed)]);}
     assert!(h.app.capsule_enabled(4) && !h.app.settings.visible_pages[4]);

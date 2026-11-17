@@ -21,14 +21,14 @@ pub const SIDE_HALF_EXTENT: f32 = 150.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SideItem {
-    Clock, Battery, Music, Focus, Bell, Weather, Ai(f32), Feature(usize),
+    Clock, Battery, Music, Focus, Bell, Weather, Ai(f32), Monitor(usize), Feature(usize),
     /// AI 额度：账号下标（None 为「+N」）与高度。
     Quota(usize, f32),
 }
 
 impl SideItem {
-    fn height(self) -> f32 {
-        match self { Self::Ai(h) => h, Self::Clock => 32.0, Self::Battery => 20.0, Self::Music => 18.0, Self::Focus => 22.0, Self::Bell => 22.0, Self::Weather => 34.0, Self::Feature(_) => 24.0, Self::Quota(_, h) => h }
+    pub(crate) fn height(self) -> f32 {
+        match self { Self::Ai(h) => h, Self::Monitor(count) => count as f32 * 30., Self::Clock => 32.0, Self::Battery => 20.0, Self::Music => 18.0, Self::Focus => 22.0, Self::Bell => 22.0, Self::Weather => 34.0, Self::Feature(_) => 24.0, Self::Quota(_, h) => h }
     }
 }
 
@@ -52,8 +52,12 @@ impl App {
                 FOCUS if self.pomo.running && self.capsule_enabled(1)=>items.push(SideItem::Focus),
                 bar::AGENT if self.ai_capsule_chip()=>items.push(SideItem::Ai(self.ai.capsule_height(self.t))),
                 QUOTA=>items.extend(self.quota_side_items().into_iter().map(|(index,h)|SideItem::Quota(index,h))),
-                CLIPBOARD|TODO|MAIL|CALENDAR|MONITOR=>{
-                    let page=match slot {CLIPBOARD=>3,TODO=>4,MAIL=>5,MONITOR=>9,_=>7};
+                MONITOR if self.capsule_enabled(9) => {
+                    let count = self.settings.monitor.capsule_items().count();
+                    if count > 0 { items.push(SideItem::Monitor(count)); }
+                },
+                CLIPBOARD|TODO|MAIL|CALENDAR=>{
+                    let page=match slot {CLIPBOARD=>3,TODO=>4,MAIL=>5,_=>7};
                     if self.capsule_enabled(page){items.push(SideItem::Feature(page));}
                 },
                 _=>{},
@@ -152,12 +156,11 @@ impl App {
                     c.text(cx, mid + 9.0, &format!("{minutes}′"), size::TINY, W::Semibold, theme::WHITE, H::Center);
                 }
                 SideItem::Weather => self.weather.draw_side(c,cx,mid,self.settings.weather_fahrenheit),
-                SideItem::Feature(9) => {
-                    c.text(cx,mid-1.,&crate::system_monitor::percent(self.monitor.sample.cpu),8.,W::Semibold,theme::WHITE,H::Center);
-                    c.text(cx,mid+8.,"CPU",6.5,W::Regular,theme::GRAY,H::Center);
-                    if c.hit(cx-14.,mid-12.,28.,24.,"side-monitor").on_hover_text(format!("CPU {} · 内存 {}",crate::system_monitor::percent(self.monitor.sample.cpu),crate::system_monitor::percent(self.monitor.sample.memory_percent()))).clicked(){self.show_page(9);}
+                SideItem::Monitor(_) => {
+                    self.draw_monitor_side(c,cx,mid);
+                    if c.hit(cx-16.,y,32.,h,"side-monitor").on_hover_text(self.monitor_capsule_tooltip()).clicked(){self.show_page(9);}
                 },
-                SideItem::Feature(page) => self.draw_capsule_feature(c,page,cx,mid,&env.today),
+                SideItem::Feature(page) => self.draw_capsule_feature(c,page,cx,mid,&env.today,38.),
                 SideItem::Quota(index, h) => self.draw_quota_side(c, cx, mid, h, index),
                 SideItem::Ai(_) => self.draw_ai_chip(c,cx,mid,34.,true),
                 SideItem::Bell => {

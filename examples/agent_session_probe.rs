@@ -11,7 +11,7 @@ fn main() {
                     let s = out.selected.as_ref();
                     println!(
                         "{}",
-                        serde_json::json!({"source":"dsh","full":full,"recent":out.recent.len(),"state":s.map(|s|s.state.label()),"model":s.map(|s|s.model.as_str()),"messages":s.map(|s|s.messages.len()),"body_bytes":s.map(|s|s.messages.iter().map(|m|m.text.len()).sum::<usize>()),"elapsed_ms":at.elapsed().as_millis(),"desktop_available":island::agent_sessions::desktop_available_for(island::agent_sessions::Source::Dsh)})
+                        serde_json::json!({"source":"dsh","full":full,"recent":out.recent.len(),"read_receipts":out.read_receipts.len(),"state":s.map(|s|s.state.label()),"model":s.map(|s|s.model.as_str()),"messages":s.map(|s|s.messages.len()),"body_bytes":s.map(|s|s.messages.iter().map(|m|m.text.len()).sum::<usize>()),"elapsed_ms":at.elapsed().as_millis(),"desktop_available":island::agent_sessions::desktop_available_for(island::agent_sessions::Source::Dsh)})
                     );
                 }
                 Err(error) => {
@@ -39,7 +39,7 @@ fn main() {
         let usage = island::resources::snapshot().unwrap_or_default();
         println!(
             "{}",
-            serde_json::json!({"full":full,"recent":out.recent.len(),"project":selected.map(|s|s.project.as_str()),"model":selected.map(|s|s.model.as_str()),"state":selected.map(|s|s.state.label()),"messages":selected.map(|s|s.messages.len()),"body_bytes":reader.retained_body_bytes(),"elapsed_ms":started.elapsed().as_millis(),"private_mib":usage.private_bytes/1048576,"error":out.error})
+            serde_json::json!({"full":full,"recent":out.recent.len(),"read_receipts":out.read_receipts.len(),"project":selected.map(|s|s.project.as_str()),"model":selected.map(|s|s.model.as_str()),"state":selected.map(|s|s.state.label()),"messages":selected.map(|s|s.messages.len()),"body_bytes":reader.retained_body_bytes(),"elapsed_ms":started.elapsed().as_millis(),"private_mib":usage.private_bytes/1048576,"error":out.error})
         );
     }
 }

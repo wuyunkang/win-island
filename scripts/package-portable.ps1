@@ -16,7 +16,7 @@ Copy-Item -LiteralPath (Join-Path $taskRoot 'docs\VALIDATION.md') -Destination (
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'activity-demo.ps1') -Destination $taskDestination -Force
 $taskBridgeDestination=Join-Path $taskDestination 'dsh-bridge'
 New-Item -ItemType Directory -Path $taskBridgeDestination -Force | Out-Null
-foreach($taskBridgeFile in @('index.mjs','adapter.mjs','bridge.mjs','install.mjs','install.ps1','package.json','README.md')){Copy-Item -LiteralPath (Join-Path $taskRoot "plugins\dsh-island-bridge\$taskBridgeFile") -Destination $taskBridgeDestination -Force}
+foreach($taskBridgeFile in @('index.mjs','adapter.mjs','bridge.mjs','client.js','install.mjs','install.ps1','package.json','README.md')){Copy-Item -LiteralPath (Join-Path $taskRoot "plugins\dsh-island-bridge\$taskBridgeFile") -Destination $taskBridgeDestination -Force}
 Copy-Item -LiteralPath (Join-Path $taskRoot 'LICENSE') -Destination $taskBridgeDestination -Force
 $taskPortableReadme=Join-Path $taskDestination 'README.md'
 $taskReadmeText=[IO.File]::ReadAllText($taskPortableReadme).Replace('(plugins/dsh-island-bridge/README.md)','(dsh-bridge/README.md)')

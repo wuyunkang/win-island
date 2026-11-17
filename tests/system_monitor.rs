@@ -17,6 +17,30 @@ fn traffic_rates_respect_elapsed_time_and_adapter_resets() {
 }
 
 #[test]
+fn traffic_rate_switches_units_before_a_fourth_integer_digit_is_displayed() {
+    use island::system_monitor::rate;
+    let kb = 1024.;
+    let mb = kb * 1024.;
+    let gb = mb * 1024.;
+    for (value, expected) in [
+        (0., "0 KB/s"),
+        (9. * kb, "9 KB/s"),
+        (999.49 * kb, "999 KB/s"),
+        (999.5 * kb, "1.0 MB/s"),
+        (99.94 * mb, "99.9 MB/s"),
+        (99.96 * mb, "100 MB/s"),
+        (999.49 * mb, "999 MB/s"),
+        (999.5 * mb, "1.0 GB/s"),
+        (999.5 * gb, "1.0 TB/s"),
+    ] {
+        assert_eq!(rate(Some(value)), expected, "原始速率：{value}");
+    }
+    for value in [None, Some(f64::NAN), Some(f64::INFINITY), Some(-1.)] {
+        assert_eq!(rate(value), "—", "无效读数不应显示为真实速度");
+    }
+}
+
+#[test]
 fn gpu_sums_processes_per_engine_then_takes_busiest_engine() {
     let rows = [
         ("pid_1_luid_a_phys_0_eng_0_engtype_3D", 30.),
@@ -51,6 +75,85 @@ fn monitor_options_normalize_invalid_intervals_and_colors() {
         .custom_colors
         .iter()
         .all(|c| island::transfer::color(c).is_some()));
+}
+
+#[test]
+fn monitor_metric_switches_migrate_and_round_trip_independently() {
+    let legacy: Settings = serde_json::from_str(r#"{"show_storage":false}"#).unwrap();
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    for name in [
+        "show_cpu",
+        "show_memory",
+        "show_gpu",
+        "show_download",
+        "show_upload",
+    ] {
+        assert_eq!(legacy_json[name], true, "旧配置应保留展开读数：{name}");
+    }
+    assert_eq!(legacy_json["show_storage"], false);
+    assert_eq!(
+        legacy_json["capsule_readings"],
+        serde_json::json!([true, true, false, false, false, false])
+    );
+
+    let chosen = serde_json::json!({"show_cpu":false,"show_memory":false,"show_gpu":true,
+        "show_download":false,"show_upload":true,"show_storage":false,"show_processes":false,
+        "capsule_readings":[false,false,true,true,false,true]});
+    let restored: Settings = serde_json::from_value(chosen.clone()).unwrap();
+    let round_trip = serde_json::to_value(&restored).unwrap();
+    for (key, value) in chosen.as_object().unwrap() {
+        assert_eq!(&round_trip[key], value, "开关应独立保存：{key}");
+    }
+}
+
+#[test]
+fn monitor_sampling_requests_only_readings_in_visible_views() {
+    use island::system_monitor::Reading;
+    let mut settings = Settings::default();
+    settings.show_cpu = false;
+    settings.show_memory = false;
+    settings.show_storage = false;
+    settings.capsule_readings = [true, false, false, false, true, true];
+    for expanded in [false, true] {
+        for capsule in [false, true] {
+            let sampling = settings.sampling_for_views(expanded, capsule);
+            for reading in Reading::ALL {
+                assert_eq!(
+                    sampling.expanded_reading(reading),
+                    (expanded && settings.expanded_reading(reading))
+                        || (capsule && settings.capsule_readings[reading as usize])
+                );
+            }
+            assert_eq!(sampling.show_processes, expanded);
+            assert_eq!(sampling.has_readings(), expanded || capsule);
+        }
+    }
+    assert!(
+        !settings.sampling_for_views(false, true).show_gpu,
+        "单独使用网速和磁盘胶囊时不能申请 GPU"
+    );
+}
+
+#[test]
+fn monitor_storage_capsule_uses_weighted_total_and_preserves_unavailable_values() {
+    use island::system_monitor::{Drive, Reading};
+    let mut sample = Sample::default();
+    assert_eq!(Reading::Storage.value(&sample), "—");
+    sample.drives = vec![
+        Drive {
+            name: "C:".into(),
+            used: 50,
+            total: 100,
+        },
+        Drive {
+            name: "D:".into(),
+            used: 0,
+            total: 300,
+        },
+    ];
+    assert_eq!(sample.storage_percent(), Some(12.5));
+    sample.drives[1].total = 0;
+    assert_eq!(sample.storage_percent(), Some(50.));
 }
 
 #[test]

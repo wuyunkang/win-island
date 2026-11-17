@@ -213,11 +213,19 @@ impl Client {
             .filter_map(|v| parse_snapshot(v, false).ok())
             .collect::<Vec<_>>();
         recent.sort_by_key(|s| std::cmp::Reverse(s.activity_ms));
-        let selected = if value["selected"].is_null() {
+        let mut selected = if value["selected"].is_null() {
             None
         } else {
             Some(parse_snapshot(&value["selected"], full)?)
         };
+        let read_receipts:Vec<_>=value["readReceipts"].as_array().into_iter().flatten().take(128).filter_map(|r| {
+            let id=r["id"].as_str().filter(|id|valid_id(id))?;
+            let viewed_at_ms=r["viewedAt"].as_i64().filter(|at|*at>0)?;
+            Some(super::SessionReadReceipt {source:Source::Dsh,id:format!("dsh:{id}"),receipt:super::ReadReceipt {viewed_at_ms:Some(viewed_at_ms),..Default::default()}})
+        }).collect();
+        for s in recent.iter_mut().chain(selected.iter_mut()) {
+            s.read_receipt=read_receipts.iter().find(|r|r.id==s.id).map(|r|r.receipt.clone());
+        }
         let error = (selected.is_none() && requested.is_some())
             .then(|| "固定的 DSH 会话暂不可读，请重新选择会话".into());
         Ok(Update {
@@ -227,6 +235,7 @@ impl Client {
             error,
             dsh_status: "DSH 桥接已连接".into(),
             ready: true,
+            read_receipts,
         })
     }
 }

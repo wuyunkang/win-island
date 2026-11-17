@@ -55,6 +55,7 @@ pub fn merge_updates(codex: Update, dsh: Update, request: &Request) -> Update {
         error,
         dsh_status: dsh.dsh_status,
         ready,
+        read_receipts: codex.read_receipts.into_iter().chain(dsh.read_receipts).collect(),
     }
 }
 pub(super) struct ReaderSet {

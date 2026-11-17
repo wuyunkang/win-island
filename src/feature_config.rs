@@ -81,7 +81,7 @@ impl App {
         }
     }
     /// 使用与主界面相同的条件和顺序，供预览与真实布局共同使用。
-    pub(crate) fn capsule_layout_for_preview(&self) -> Layout {
+    pub(crate) fn capsule_layout_for_preview(&self, ctx: &eframe::egui::Context) -> Layout {
         let bell = self.t < self.notification_bell_until && !self.compact_notices();
         let battery = self.settings.show_battery && self.resident_power.0.is_some();
         let mut layout = Layout::new(
@@ -96,15 +96,23 @@ impl App {
             layout.add_weather();
         }
         for page in [3, 4, 5, 7, 9] {
-            if self.capsule_enabled(page) {
+            if self.capsule_enabled(page) && (page != 9 || self.settings.monitor.capsule_items().next().is_some()) {
                 layout.add_feature(feature_slot(page).unwrap());
             }
+        }
+        if layout.x[bar::MONITOR].is_some() {
+            let reserve = if self.settings.clock_period != 0 { 40. } else { 0. }
+                + self.quota_balance_layout(ctx).iter().map(|(_, extra)| *extra).sum::<f32>()
+                + if self.ai_capsule_chip() { self.ai.capsule_min_width() + 12. } else { 0. };
+            let available = (crate::app::WIN_W - 32. - reserve - layout.width + layout.widths[bar::MONITOR]).max(46.);
+            let width = self.monitor_capsule_width(ctx).min(available);
+            layout.widen_slot(bar::MONITOR, width - layout.widths[bar::MONITOR]);
         }
         if self.ai_capsule_chip(){
             layout.add_feature(bar::AGENT);
             let reserve=if self.settings.clock_period!=0{40.0}else{0.0};
-            let preferred=self.ai.capsule_width(self.t);
-            let minimum=if preferred>160. {168.} else if preferred>27. {80.} else {27.};
+            let preferred=self.ai.capsule_width(ctx,self.t);
+            let minimum=self.ai.capsule_min_width();
             let width=preferred.min((crate::app::WIN_W-32.-reserve-layout.width+27.).max(minimum));
             layout.widen_slot(bar::AGENT,width-27.);
         }
@@ -147,10 +155,13 @@ impl App {
         x: f32,
         y: f32,
         today: &str,
+        slot_width: f32,
     ) {
         if page==9 {
-            self.draw_monitor_compact(c,x,y);
-            if c.hit(x-35.,y-12.,70.,24.,("capsule-feature",page)).on_hover_text("系统监控 · CPU / 内存").clicked(){self.show_page(9);}
+            let width = self.monitor_capsule_width(c.ui.ctx());
+            if width <= 0. { return; }
+            self.draw_monitor_compact(&c.scaled(x,y,(slot_width/width).min(1.)),x,y);
+            if c.hit(x-slot_width/2.,y-12.,slot_width,24.,("capsule-feature",page)).on_hover_text(self.monitor_capsule_tooltip()).clicked(){self.show_page(9);}
             return;
         }
         let count = self.capsule_count(page, today);

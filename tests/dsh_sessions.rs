@@ -37,7 +37,7 @@ fn dsh_reader_bounds_body_and_does_not_invent_unknown_metrics() {
 
 #[test]
 fn mixed_sources_follow_latest_and_pin_keeps_its_source() {
-    use island::agent_sessions::{merge_updates, Request, Snapshot, Update};
+    use island::agent_sessions::{merge_updates, ReadReceipt, SessionReadReceipt, Request, Snapshot, Update};
     let codex = Snapshot {
         id: "same".into(),
         path: "F:/codex/a.jsonl".into(),
@@ -59,17 +59,20 @@ fn mixed_sources_follow_latest_and_pin_keeps_its_source() {
         selected: Some(codex.clone()),
         recent: vec![codex.clone()],
         ready: true,
+        read_receipts: vec![SessionReadReceipt {source:Source::Codex,id:"same".into(),receipt:ReadReceipt {revision:"codex-read".into(),..Default::default()}}],
         ..Default::default()
     };
     let d = || Update {
         selected: Some(dsh.clone()),
         recent: vec![dsh.clone()],
         ready: true,
+        read_receipts: vec![SessionReadReceipt {source:Source::Dsh,id:"dsh:same".into(),receipt:ReadReceipt {viewed_at_ms:Some(200),..Default::default()}}],
         ..Default::default()
     };
     let out = merge_updates(c(), d(), &req);
     assert_eq!(out.selected.unwrap().source, Source::Dsh);
     assert_eq!(out.recent.len(), 2);
+    assert_eq!(out.read_receipts.len(),2,"混合来源必须同时保留各自回执");
     let fixed = Request {
         pinned: Some(codex.path.clone()),
         ..req.clone()
@@ -142,12 +145,14 @@ fn dsh_http_client_authenticates_and_rejects_nonlocal_discovery() {
         assert!(headers.contains(&format!("Bearer {}", "a".repeat(64))));
         assert!(headers.starts_with("POST /snapshot"));
         let s = json!({"id":"main","state":"completed","updatedAt":1000,"messages":[{"kind":"answer","text":"公开答复"}]});
-        let body = json!({"version":1,"sessions":[s.clone()],"selected":s}).to_string();
+        let body = json!({"version":1,"sessions":[s.clone()],"selected":s,"readReceipts":[{"id":"main","viewedAt":2000},{"id":"../../other","viewedAt":2000},{"id":"negative","viewedAt":-1}]}).to_string();
         write!(socket,"HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
     });
     let client = dsh::Client::new(path.clone());
     let out = client.poll(true, None).unwrap();
     assert!(out.ready);
+    assert_eq!(out.read_receipts.len(),1);assert_eq!(out.read_receipts[0].id,"dsh:main");
+    assert_eq!(out.selected.as_ref().unwrap().read_receipt.as_ref().unwrap().viewed_at_ms,Some(2000));
     assert_eq!(out.selected.unwrap().answer(), Some("公开答复"));
     worker.join().unwrap();
     std::fs::write(

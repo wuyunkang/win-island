@@ -47,7 +47,7 @@ function applyEvent(row,event,body=false){
 }
 
 export function createDshAdapter(ctx){
-  const cache=new Map();let inventory=[],inventoryAt=0,inventoryJob;
+  const cache=new Map(),viewed=new Map();let inventory=[],inventoryAt=0,inventoryJob;
   const service=name=>{try{return ctx[name]??ctx.get?.(name);}catch{return undefined;}};
   const remember=(header,agent)=>{
     if(!header||!validId(header.id)||header.origin==='subagent')return null;
@@ -62,6 +62,12 @@ export function createDshAdapter(ctx){
     const row=remember(header,agent);return row?normalizeSnapshot(row):null;
   };
   return {
+    markRead(ids,at=Date.now()){
+      if(!Number.isSafeInteger(at)||at<=0)return;
+      for(const id of ids.slice(0,64)){if(!validId(id))continue;viewed.delete(id);viewed.set(id,at);}
+      while(viewed.size>128)viewed.delete(viewed.keys().next().value);
+    },
+    readReceipts(){return [...viewed].map(([id,viewedAt])=>({id,viewedAt}));},
     async list(signal){
       if(!inventoryAt||Date.now()-inventoryAt>10000){inventoryJob??=(async()=>{inventory=await service('sessionQuery')?.listSessions(signal)??[];inventoryAt=Date.now();})().finally(()=>inventoryJob=undefined);await inventoryJob;}
       const agents=Array.from(service('agents')?.list?.()??[]);const headers=inventory.slice(0,32).map(s=>s.header);

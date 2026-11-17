@@ -65,8 +65,10 @@ const SWELL: (f32, f32) = (1.075, 1.13);
 // 展开：欠阻尼，末段约 5% 过冲后回落；高度略软于宽度，像「垂落」下来。
 const OPEN_W: (f32, f32) = (330.0, 0.70);
 const OPEN_H: (f32, f32) = (290.0, 0.74);
-// 收起：临界阻尼，约 0.18 s 干净收回，无回弹。
-const CLOSE: (f32, f32) = (620.0, 1.0);
+// 收起：稍柔和的临界阻尼，减轻起步急缩，末段平稳贴回，无回弹。
+const CLOSE: (f32, f32) = (480.0, 1.0);
+// 尺寸误差低于 0.02 点且速度低于 0.2 点/秒才贴齐目标，避免尾段跳像素。
+const MORPH_REST_SCALE: f32 = 10.0;
 const SWELL_K: (f32, f32) = (420.0, 0.8);
 const PAGE_SLIDE: f32 = 46.0;
 
@@ -140,6 +142,9 @@ pub struct Unread { pub source: Messenger, pub pid: u32, pub window: isize }
 impl Unread {
     pub fn of(source: Messenger) -> Self { Self { source, pid: 0, window: 0 } }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UnreadSource { Messenger(Messenger), Agent(crate::agent_sessions::Source) }
 
 /// 展开后未读胶囊的宽度、离面板的间距和每个图标占的高度。
 pub(crate) const UNREAD_W: f32 = 40.0;
@@ -610,6 +615,10 @@ pub struct App {
     pub(crate) w: Spring,
     pub(crate) h: Spring,
     pub(crate) open: bool,
+    /// 上一帧形变已接受的状态，用于识别菜单等外部入口刚触发的开合。
+    morph_open: bool,
+    /// 只接回鼠标移开引起的收起，前台切换等强制收起仍保留防误触延迟。
+    resume_hover: bool,
     hover_since: Option<f64>,
     leave_since: Option<f64>,
     /// 前台切换导致的强制收起：光标离开前不再自动展开。
@@ -711,6 +720,7 @@ pub struct App {
     notice_width: Spring,
     notice_details: bool,
     pub pending_messengers:Vec<Unread>,
+    pub(crate) pending_agents:Vec<crate::agent_sessions::Snapshot>,
     messenger_scroll: f32,
     pub(crate) alerts: std::collections::VecDeque<Alert>,
     pub(crate) history: std::collections::VecDeque<Alert>,
@@ -783,6 +793,8 @@ impl App {
             w: Spring::new(bw, CLOSE.0, CLOSE.1),
             h: Spring::new(bh, CLOSE.0, CLOSE.1),
             open: false,
+            morph_open: false,
+            resume_hover: false,
             hover_since: None,
             leave_since: None,
             hover_lock: false,
@@ -835,7 +847,7 @@ impl App {
             music_artwork: None,
             forced_open_until:0.0, settings_open:false, settings_resources_active:false, displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, wechat_status:String::new(), dingtalk_status:String::new(), live_api_status:String::new(), activities:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
             listener_status: "尚未连接".into(),
-            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
+            notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), pending_agents:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
             todo_first: 0, todo_choosing: false, pet: Default::default(), last_drink: None,
             toast: None, toast_below: false,
             last_input: 0.0, system_idle: None,
@@ -1392,6 +1404,7 @@ impl App {
 
     pub fn foreground_changed(&mut self) {
         if self.todo_ime_frame {return;}
+        self.resume_hover=false;
         self.hover_lock=true;
         if self.adding && self.buf.trim().is_empty(){self.cancel_edit();}
     }
@@ -1442,7 +1455,7 @@ impl App {
         self.settings.island_lyrics && self.capsule_enabled(0) && self.media.is_music()
             && !self.browser_minimal_active
     }
-    pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||matches!(a.source,crate::extras::AlertSource::Activity(_))||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
+    pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||matches!(a.source,crate::extras::AlertSource::Activity(_)|crate::extras::AlertSource::Agent {..})||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
 
     /// 换句、分段和展开高亮共用时间调整；正数延后，负数提前。
     pub(crate) fn lyric_position(&self)->f32 {(self.media.position-self.settings.lyric_delay_ms as f64/1000.0)as f32}
@@ -1516,7 +1529,7 @@ impl App {
         }
         if self.side() {
             // 左右停靠：竖向胶囊（通知仍是贴边滑出的横向卡片，见上）。
-            return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.pending_messengers.is_empty()));
+            return self.side_base_size(self.effective_minimal()&&self.t>=self.notification_bell_until&&(self.browser_minimal_active||self.unread_count()==0));
         }
         if self.island_lyrics_active() {
             (self.lyric_bar_width(),BAR_H)
@@ -1568,6 +1581,7 @@ impl App {
         let browser_minimal=self.settings.browser_minimal && self.browser_at_top;
         if browser_minimal && !self.browser_minimal_active {
             self.open=false;
+            self.resume_hover=false;
             self.hover_lock=true;
             self.hover_since=None;
             self.leave_since=None;
@@ -1600,7 +1614,7 @@ impl App {
         self.monitor_tick(&ctx);
         if self.weather_polling_needed(){self.weather.update(&self.settings.weather_city,self.settings.weather_interval,&ctx);}else{self.weather.release();}
         self.release_hidden_resources(&ctx);
-        let mut layout=self.capsule_layout_for_preview();
+        let mut layout=self.capsule_layout_for_preview(&ctx);
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
         if self.pet_enabled() {
@@ -1750,8 +1764,8 @@ impl App {
         self.paint_body(&painter, body, flare, flare_h, radius, feather);
         let content_from=crate::skin_paint::shape_count(&ctx,layer);
 
-        // 内容只随形体「揭开」：不缩放，按面板裁剪，到 55% 才开始淡入
-        let reveal = if self.open { smoothstep(0.50, 0.97, p) } else { smoothstep(0.55, 0.92, p) };
+        // 开合共用同一揭开曲线，中途反向时保持透明度与位移连续。
+        let reveal = smoothstep(0.50, 0.97, p);
         self.reveal = reveal;
         let origin = self.content_origin(win);
         let clip = panel.intersect(win);
@@ -1905,8 +1919,8 @@ impl App {
             shapes.extend(tooltips.iter().map(|r|GlassShape::Round(rel(*r),6.0)));
             shapes
         });
-        let transitioning = !self.w.settled(self.expanded_width())
-            || !self.h.settled(self.expanded_height())
+        let transitioning = !self.w.settled(MORPH_REST_SCALE)
+            || !self.h.settled(MORPH_REST_SCALE)
             || self.page_e() < 0.7
             || self.dots.iter().any(|d| !d.settled(16.0))
             || self.hover_since.is_some() && !self.open
@@ -1984,31 +1998,36 @@ impl App {
         match self.unread_tag(i){Some(n) if n>1=>format!("{name}{n}"),_=>name.to_string()}
     }
     /// 展开胶囊高度：一个是圆，两个是短胶囊，三个及以上与面板等高（多出的滚动）。
+    fn unread_count(&self)->usize {self.pending_messengers.len()+self.pending_agents.len()}
     fn unread_capsule_height(&self,panel_h:f32)->f32 {
-        let n=self.pending_messengers.len();
+        let n=self.unread_count();
         if n>=3 {panel_h} else {4.0+UNREAD_SLOT*n as f32}
     }
     pub(crate) fn unread_top_inset(&self)->f32 {if self.dock()==model::Dock::Top {UNREAD_GAP}else{0.0}}
     fn unread_slot(&self,height:f32)->f32 {
-        if self.pending_messengers.len()>=3 {(height-4.0)/3.0} else {UNREAD_SLOT}
+        if self.unread_count()>=3 {(height-4.0)/3.0} else {UNREAD_SLOT}
     }
     /// 收起时叠放的来源图标（最多两个）。
-    fn unread_sources(&self)->Vec<Messenger>{
+    fn unread_sources(&self)->Vec<UnreadSource>{
         let mut sources=Vec::new();
-        for u in &self.pending_messengers {if !sources.contains(&u.source){sources.push(u.source);}}
+        for u in &self.pending_messengers {let source=UnreadSource::Messenger(u.source);if !sources.contains(&source){sources.push(source);}}
+        for u in &self.pending_agents {let source=UnreadSource::Agent(u.source);if !sources.contains(&source){sources.push(source);}}
         sources
     }
     /// 收起时叠放区沿胶囊方向的长度。
     fn unread_stack_len(&self,horizontal:bool)->f32 {
-        let icons=self.unread_sources().len().min(3) as f32;
+        let icons=self.unread_sources().len() as f32;
         32.0+unread_step(horizontal)*(icons-1.0)
     }
 
     fn messenger_badge_rect(&self,win:Rect,panel:Rect)->Option<Rect>{
-        if self.pending_messengers.is_empty() || self.browser_minimal_active && !self.open {return None;}
+        if self.unread_count()==0 || self.browser_minimal_active && !self.open {return None;}
         // 完整横幅已包含该来源图标。歌词模式和横幅收起后使用常驻入口。
-        if !self.open && !self.compact_notices() && self.pending_messengers.len()==1
-            && self.notice.as_ref().and_then(|a|a.messenger())==self.pending_messengers.first().map(|u|u.source){return None;}
+        if !self.open && !self.compact_notices() && self.unread_count()==1
+            && self.notice.as_ref().is_some_and(|a| match &a.source {
+                crate::extras::AlertSource::Agent {source,path,..}=>self.pending_agents.first().is_some_and(|s|s.source==*source&&s.path==*path),
+                _=>a.messenger().is_some_and(|source|self.pending_messengers.first().is_some_and(|u|u.source==source)),
+            }){return None;}
         let bounds=self.screen.map_or(win,|screen|screen.intersect(win));
         let appear=self.messenger_appear();
         if appear>0.02 {
@@ -2042,7 +2061,7 @@ impl App {
 
     /// 展开后的未读胶囊：每个账号一个图标，点击跳到对应窗口；超过三个时滚轮翻看。
     fn draw_unread_capsule(&mut self,ctx:&egui::Context,c:&Card,rect:Rect,cursor:Option<Pos2>,cmds:&mut Vec<Cmd>){
-        let n=self.pending_messengers.len();
+        let n=self.unread_count();
         let height=rect.height()/c.s;
         let slot=self.unread_slot(height);
         let max_scroll=(n as f32-3.0).max(0.0)*slot;
@@ -2055,9 +2074,18 @@ impl App {
         let inner=c.clipped(0.0,2.0,UNREAD_W,height-4.0);
         let x=UNREAD_W/2.0;
         for i in 0..n {
-            let u=self.pending_messengers[i];
             let cy=2.0+slot*(i as f32+0.5)-self.messenger_scroll;
             if cy< -slot || cy>height+slot {continue;}
+            if i>=self.pending_messengers.len() {
+                let task=self.pending_agents[i-self.pending_messengers.len()].clone();
+                crate::ai_ui::draw_agent_symbol(&inner,task.source,task.state,x,cy,self.t);
+                inner.circle(x+10.,cy-9.,2.6,Color32::from_rgb(255,72,72));
+                let button=crate::quota_ui::bar_tooltip(inner.hit(0.,cy-slot/2.,UNREAD_W,slot,("agent-unread",task.source.label(),task.id.as_str())),
+                    format!("{} · {}\n{}",task.source.label(),task.state.label(),task.project));
+                if button.clicked(){cmds.push(Cmd::AgentReturn(task.source));self.viewed_agent(task.source,&task.path);break;}
+                continue;
+            }
+            let u=self.pending_messengers[i];
             let scale=if u.source==Messenger::Wechat {1.0}else{1.12};
             crate::extras::messenger_icon(&inner.scaled(x,cy,scale),x,cy,u.source);
             inner.circle(x+10.0,cy-9.0,2.6,Color32::from_rgb(255,72,72));
@@ -2066,7 +2094,7 @@ impl App {
                 inner.centered_text(x+10.0,cy+8.5,&tag.to_string(),8.5,W::Bold,Color32::from_gray(28),H::Center);
             }
             let name=match self.unread_tag(i){Some(n)=>format!("{} · 账号 {n}",u.source.name()),None=>u.source.name().to_string()};
-            let button=inner.hit(0.0,cy-slot/2.0,UNREAD_W,slot,self.unread_id(i)).on_hover_text(format!("查看{name}"));
+            let button=crate::quota_ui::bar_tooltip(inner.hit(0.0,cy-slot/2.0,UNREAD_W,slot,self.unread_id(i)),format!("查看{name}"));
             if button.clicked(){cmds.push(Cmd::ViewMessenger(u));}
         }
         if max_scroll>0.0 {
@@ -2080,24 +2108,37 @@ impl App {
     /// 收起时的未读入口：每个来源一个图标加小红点（同一来源多个账号合成一个）。只有一条时点它直接跳转，多条时展开面板挑选。
     fn draw_unread_stack(&mut self,c:&Card,horizontal:bool,cmds:&mut Vec<Cmd>){
         let sources=self.unread_sources();
-        let count=self.pending_messengers.len();
-        let icons=sources.len().min(3);
+        let count=self.unread_count();
+        let icons=sources.len();
         let step=unread_step(horizontal);
         let at=|k:usize|if horizontal {(16.0+step*k as f32,14.0)}else{(16.0,14.0+step*k as f32)};
         for k in 0..icons {
             let (x,y)=at(k);
-            let scale=if sources[k]==Messenger::Wechat {0.85}else{0.92};
-            crate::extras::messenger_icon(&c.scaled(x,y,scale),x,y,sources[k]);
+            match sources[k] {
+                UnreadSource::Messenger(source)=>{
+                    let scale=if source==Messenger::Wechat {0.85}else{0.92};
+                    crate::extras::messenger_icon(&c.scaled(x,y,scale),x,y,source);
+                },
+                UnreadSource::Agent(source)=>{
+                    let state=self.pending_agents.iter().filter(|s|s.source==source).max_by_key(|s|s.activity_ms).map(|s|s.state).unwrap_or_default();
+                    crate::ai_ui::draw_agent_symbol(&c.scaled(x,y,0.85),source,state,x,y,self.t);
+                },
+            }
         }
         // 每个来源图标右上角一个小红点，不显示数字。
         for k in 0..icons {let (x,y)=at(k);c.circle(x+8.0,y-7.0,2.6,Color32::from_rgb(255,59,48));}
         let (w,h)=if horizontal {(self.unread_stack_len(true),BAR_H)}else{(32.0,self.unread_stack_len(false))};
         if count==1 {
-            let u=self.pending_messengers[0];
-            let button=c.hit(0.0,0.0,w,h,u.source.name()).on_hover_text(format!("查看{}",u.source.name()));
-            if button.clicked(){cmds.push(Cmd::ViewMessenger(u));}
+            if let Some(u)=self.pending_messengers.first().copied() {
+                let button=crate::quota_ui::bar_tooltip(c.hit(0.0,0.0,w,h,u.source.name()),format!("查看{}",u.source.name()));
+                if button.clicked(){cmds.push(Cmd::ViewMessenger(u));}
+            }else if let Some(task)=self.pending_agents.first().cloned() {
+                let button=crate::quota_ui::bar_tooltip(c.hit(0.,0.,w,h,("agent-unread",task.source.label(),task.id.as_str())),
+                    format!("{} · {}\n{}",task.source.label(),task.state.label(),task.project));
+                if button.clicked(){cmds.push(Cmd::AgentReturn(task.source));self.viewed_agent(task.source,&task.path);}
+            }
         }else{
-            let button=c.hit(0.0,0.0,w,h,"messenger-stack").on_hover_text(format!("{count} 条未读 · 展开挑选"));
+            let button=crate::quota_ui::bar_tooltip(c.hit(0.0,0.0,w,h,"messenger-stack"),format!("{count} 条未读 · 展开挑选"));
             if button.clicked(){self.reveal_unread();}
         }
     }
@@ -2222,12 +2263,19 @@ impl App {
     /// 悬停状态机：意图缓冲 → 弹簧展开 → 离开延迟 → 临界阻尼收起；全程可打断。
     fn morph(&mut self, want: bool, inside: bool, t: f64, dt: f32) {
         let (bw, bh) = self.base_size();
+        // 外部入口刚改目标时，之前的空闲时间不属于这次动画。
+        let mut motion_dt = if self.open != self.morph_open { 0.0 } else { dt };
+        if self.open != self.morph_open {self.resume_hover=false;}
         if want {
             self.leave_since = None;
+            let first_hover = self.hover_since.is_none();
             let since = *self.hover_since.get_or_insert(t);
             let intent=if self.effective_minimal() {MINIMAL_HOVER_INTENT.max(self.settings.appearance.open_delay as f64/1000.0)}else{self.settings.appearance.open_delay as f64/1000.0};
-            if !self.open && (self.drag_hot || self.settings.appearance.click_to_expand && inside || t - since >= intent) {
+            let immediate = self.drag_hot || self.settings.appearance.click_to_expand && inside || self.resume_hover && self.progress() > 0.04;
+            if !self.open && (immediate || t - since >= intent) {
+                self.advance_morph_until(if immediate {t}else{since+intent},t,&mut motion_dt);
                 self.open = true;
+                self.resume_hover = false;
                 self.w.tune(OPEN_W.0, OPEN_W.1);
                 self.h.tune(OPEN_H.0, OPEN_H.1);
                 self.w.target = self.expanded_width();
@@ -2238,6 +2286,7 @@ impl App {
                     self.h.vel = self.h.vel.max(260.0);
                 }
             } else if !self.open {
+                if first_hover {self.advance_morph_until(t,t,&mut motion_dt);}
                 self.w.tune(SWELL_K.0, SWELL_K.1);
                 self.h.tune(SWELL_K.0, SWELL_K.1);
                 // 悬停时轻微胀大：厚度方向胀得多一点（侧边停靠时厚度是宽度）。
@@ -2246,11 +2295,13 @@ impl App {
                 self.h.target = bh * sh;
             }
         } else {
-            self.hover_since = None;
+            let stopped_hover = self.hover_since.take().is_some();
             if self.open {
                 let since = *self.leave_since.get_or_insert(t);
                 if t - since >= self.settings.appearance.close_delay as f64/1000.0 {
+                    self.advance_morph_until(since+self.settings.appearance.close_delay as f64/1000.0,t,&mut motion_dt);
                     self.open = false;
+                    self.resume_hover = !self.hover_lock;
                     self.leave_since = None;
                     self.w.tune(CLOSE.0, CLOSE.1);
                     self.h.tune(CLOSE.0, CLOSE.1);
@@ -2260,6 +2311,7 @@ impl App {
                     self.confirm_clear = None;
                 }
             } else {
+                if stopped_hover {self.advance_morph_until(t,t,&mut motion_dt);}
                 self.w.tune(CLOSE.0, CLOSE.1);
                 self.h.tune(CLOSE.0, CLOSE.1);
                 self.w.target = bw;
@@ -2268,18 +2320,29 @@ impl App {
         }
         let _ = inside;
         if self.open {self.w.target=self.expanded_width();self.h.target=self.expanded_height();}
+        self.morph_open=self.open;
         let (prev_w,prev_h)=(self.w.pos,self.h.pos);
-        self.w.step(dt);if !self.settings.appearance.animations{self.w.pos=self.w.target;self.w.vel=0.0;self.h.pos=self.h.target;self.h.vel=0.0;}
-        self.h.step(dt);
+        self.w.step(motion_dt);self.h.step(motion_dt);
+        if !self.settings.appearance.animations{self.w.snap(self.w.target);self.h.snap(self.h.target);}
         // 仅在从外侧越过目标时收住，扩展提示条时不强制跳到目标宽度。
         if !self.open {
             if prev_w>=bw && self.w.pos<bw {self.w.snap(bw);}
             if prev_h>=bh && self.h.pos<bh {self.h.snap(bh);}
         }
+        for spring in [&mut self.w,&mut self.h] {
+            if spring.settled(MORPH_REST_SCALE) {spring.snap(spring.target);}
+        }
         for d in &mut self.dots {
             d.step(dt);
         }
         self.slide.step(dt);
+    }
+
+    /// 先沿旧目标走到切换时刻，保留速度；只有余下的时间推进新目标。
+    fn advance_morph_until(&mut self, at:f64, now:f64, remaining:&mut f32) {
+        let before=(at-(now-f64::from(*remaining))).clamp(0.0,f64::from(*remaining)) as f32;
+        self.w.step(before);self.h.step(before);
+        *remaining=(*remaining-before).max(0.0);
     }
 
     // ---------------------------------------------------------------
@@ -2383,7 +2446,7 @@ impl App {
             self.draw_ai_bar(&c,local_cx,&layout);
             if let Some(x)=layout.x[bar::WEATHER] {self.weather.draw_resident(&c,local_cx+x,self.settings.weather_fahrenheit);}
             for page in [3,4,5,7,9] {
-                if let Some(x)=crate::feature_config::feature_slot(page).and_then(|slot|layout.x[slot]) {self.draw_capsule_feature(&c,page,local_cx+x,15.0,&env.today);}
+                if let Some(slot)=crate::feature_config::feature_slot(page) {if let Some(x)=layout.x[slot] {self.draw_capsule_feature(&c,page,local_cx+x,15.0,&env.today,layout.widths[slot]);}}
             }
         }
         if self.pomo.running && compact_alpha>0.004 {

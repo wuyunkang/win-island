@@ -57,7 +57,10 @@ export async function startBridge({discoveryPath,adapter,idleMs=5000}){
       let selected=sessions.find(s=>s.id===selectedId)??null;
       if(body.full&&selectedId){selected=normalizeSnapshot(await adapter.detail(selectedId,controller.signal),true);}
       else if(!selected&&selectedId&&adapter.summary){selected=normalizeSnapshot(await adapter.summary(selectedId,controller.signal),false);}
-      reply(200,{version:1,sessions,selected});
+      const readReceipts=Array.from(adapter.readReceipts?.()??[]).slice(0,128)
+        .filter(r=>validId(r?.id)&&Number.isSafeInteger(r.viewedAt)&&r.viewedAt>0)
+        .map(r=>({id:r.id,viewedAt:r.viewedAt}));
+      reply(200,{version:1,sessions,selected,readReceipts});
     }catch{reply(503,{error:'DSH 会话暂不可读'});}
   });
   server.requestTimeout=2000;server.headersTimeout=2000;server.maxConnections=4;

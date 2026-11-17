@@ -27,6 +27,32 @@ pub struct Sampler {
 fn ticks(time: FILETIME) -> u64 {
     (time.dwHighDateTime as u64) << 32 | time.dwLowDateTime as u64
 }
+
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    #[test]
+    fn native_monitor_releases_disabled_sampling_channels() {
+        let mut sampler = Sampler::default();
+        let settings = Settings {
+            show_gpu: false,
+            show_processes: false,
+            show_storage: false,
+            ..Default::default()
+        };
+        let _ = sampler.sample(&settings);
+        let disabled = sampler.sample(&settings.sampling_for_views(false, false));
+        assert!(
+            disabled.cpu.is_none() && disabled.memory_total.is_none() && disabled.gpu.is_none()
+        );
+        assert!(disabled.download.is_none() && disabled.upload.is_none());
+        assert!(disabled.drives.is_empty() && disabled.processes.is_empty());
+        assert!(
+            sampler.cpu.is_none() && sampler.network.is_empty() && sampler.processes.is_empty()
+        );
+        assert!(sampler.gpu.is_none() && !sampler.gpu_tried && sampler.drives_at.is_none());
+    }
+}
 impl Sampler {
     pub fn sample(&mut self, settings: &Settings) -> Sample {
         let now = Instant::now();
@@ -47,7 +73,9 @@ impl Sampler {
                 FILETIME::default(),
                 FILETIME::default(),
             );
-            if GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_ok() {
+            if settings.show_cpu
+                && GetSystemTimes(Some(&mut idle), Some(&mut kernel), Some(&mut user)).is_ok()
+            {
                 let current = [ticks(idle), ticks(kernel), ticks(user)];
                 sample.cpu = self.cpu.and_then(|old| cpu_percent(old, current));
                 self.cpu = Some(current);
@@ -58,21 +86,30 @@ impl Sampler {
                 dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
                 ..Default::default()
             };
-            if GlobalMemoryStatusEx(&mut memory).is_ok() {
+            if settings.show_memory && GlobalMemoryStatusEx(&mut memory).is_ok() {
                 sample.memory_total = Some(memory.ullTotalPhys);
                 sample.memory_used = Some(memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys));
             }
-            if settings.compact {
-                self.network = HashMap::new();
-                self.gpu = None;
-                self.gpu_tried = false;
-            } else {
+            if settings.show_download || settings.show_upload {
                 self.network(&mut sample, elapsed);
+                if !settings.show_download {
+                    sample.download = None;
+                }
+                if !settings.show_upload {
+                    sample.upload = None;
+                }
+            } else {
+                self.network = HashMap::new();
+            }
+            if settings.show_gpu {
                 if !self.gpu_tried {
                     self.gpu = Gpu::open();
                     self.gpu_tried = true;
                 }
                 sample.gpu = self.gpu.as_mut().and_then(|g| g.read());
+            } else {
+                self.gpu = None;
+                self.gpu_tried = false;
             }
             if settings.show_storage {
                 if self

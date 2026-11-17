@@ -58,7 +58,7 @@ impl crate::app::App {
         });
         ui.add_space(12.0);
         let indices=self.quota_bar_indices();let count=indices.len();
-        let mut layout=self.capsule_layout_for_preview();
+        let mut layout=self.capsule_layout_for_preview(ui.ctx());
         layout.reorder(&order);
         for (position,extra) in self.quota_balance_layout(ui.ctx()){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
@@ -91,7 +91,7 @@ impl crate::app::App {
         for (index,&slot) in order.iter().enumerate(){
             let Some(position)=layout.x[slot] else {continue;};
             let x=cx+position;
-            let width=match slot{AGENT=>layout.widths[AGENT],CLOCK=>if self.settings.clock_period!=0 {84.0}else{44.0},BATTERY=>20.0,PET=>32.0,MUSIC=>14.0,FOCUS=>crate::focus_bar::WIDTH,WEATHER=>64.0,MONITOR=>72.0,CLIPBOARD|TODO|MAIL|CALENDAR=>38.0,_=>{
+            let width=match slot{AGENT|MONITOR=>layout.widths[slot],CLOCK=>if self.settings.clock_period!=0 {84.0}else{44.0},BATTERY=>20.0,PET=>32.0,MUSIC=>14.0,FOCUS=>crate::focus_bar::WIDTH,WEATHER=>64.0,CLIPBOARD|TODO|MAIL|CALENDAR=>38.0,_=>{
                 let left=layout.quota_slots().filter_map(|i|layout.x[i].map(|x|x-layout.widths[i]/2.0)).fold(f32::INFINITY,f32::min);
                 let right=layout.quota_slots().filter_map(|i|layout.x[i].map(|x|x+layout.widths[i]/2.0)).fold(f32::NEG_INFINITY,f32::max);
                 right-left
@@ -121,7 +121,7 @@ impl crate::app::App {
                 CLIPBOARD|TODO|MAIL|CALENDAR|MONITOR=>{
                     let page=match slot {CLIPBOARD=>3,TODO=>4,MAIL=>5,MONITOR=>9,_=>7};
                     let today=chrono::Local::now().format("%Y-%m-%d").to_string();
-                    self.draw_capsule_feature(&c,page,x,15.0,&today);
+                    self.draw_capsule_feature(&c,page,x,15.0,&today,width);
                 },
                 _=>{c.ring(x,15.0,10.0,2.0,theme::GRAY);c.text(x,18.0,"AI",7.0,W::Bold,theme::WHITE,H::Center);},
             }

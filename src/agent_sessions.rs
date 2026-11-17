@@ -6,11 +6,13 @@ use std::path::PathBuf;
 mod desktop;
 pub mod dsh;
 mod projects;
+mod read_receipts;
 mod reader;
 mod sources;
 pub use desktop::{activate as activate_desktop, available as desktop_available};
 pub use desktop::{activate_for as activate_desktop_for, available_for as desktop_available_for};
 pub use reader::{Reader, Request, Service, Update};
+pub use read_receipts::{ReadReceipt, SessionReadReceipt};
 pub use sources::{merge_updates, Sources};
 
 pub const MAX_MESSAGES: usize = 64;
@@ -123,6 +125,7 @@ pub struct Snapshot {
     pub context: Option<ContextUsage>,
     pub plan: Option<PlanProgress>,
     pub tools: Vec<String>,
+    pub read_receipt: Option<ReadReceipt>,
 }
 impl Snapshot {
     pub fn summary(&self) -> Self {
@@ -152,6 +155,7 @@ impl Snapshot {
             context: self.context.clone(),
             plan: self.plan.clone(),
             tools: self.tools.clone(),
+            read_receipt: self.read_receipt.clone(),
         }
     }
     pub fn answer(&self) -> Option<&str> {
@@ -172,6 +176,8 @@ pub struct Config {
     pub quota_tab: bool,
     pub codex_enabled: bool,
     pub dsh_enabled: bool,
+    pub codex_notifications: bool,
+    pub dsh_notifications: bool,
     pub dsh_discovery: String,
 }
 impl Default for Config {
@@ -183,11 +189,19 @@ impl Default for Config {
             quota_tab: false,
             codex_enabled: true,
             dsh_enabled: true,
+            codex_notifications: true,
+            dsh_notifications: true,
             dsh_discovery: String::new(),
         }
     }
 }
 impl Config {
+    pub fn notifications_enabled(&self, source: Source) -> bool {
+        self.source_enabled(source) && match source {
+            Source::Codex => self.codex_notifications,
+            Source::Dsh => self.dsh_notifications,
+        }
+    }
     pub fn source_enabled(&self, source: Source) -> bool {
         self.enabled
             && match source {
@@ -208,11 +222,16 @@ impl Config {
         }
     }
     pub fn load() -> Self {
-        std::fs::read(crate::model::config_dir().join("ai-sessions.json"))
+        let mut config: Self = std::fs::read(crate::model::config_dir().join("ai-sessions.json"))
             .ok()
             .filter(|v| v.len() < 64 * 1024)
             .and_then(|v| serde_json::from_slice(&v).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // 旧版统一关闭迁移为两个来源均关闭，之后只使用各自总开关。
+        if !config.enabled {
+            config.codex_enabled=false;config.dsh_enabled=false;config.enabled=true;
+        }
+        config
     }
     pub fn save(&self) {
         let root = crate::model::config_dir();
@@ -247,6 +266,8 @@ pub struct Parser {
     last_public: Option<(MessageKind, u64)>,
     bytes: usize,
     event_ms: i64,
+    waiting_calls: std::collections::HashSet<String>,
+    awaiting_async_input: bool,
 }
 impl Parser {
     pub fn new(full: bool) -> Self {
@@ -259,6 +280,8 @@ impl Parser {
             last_public: None,
             bytes: 0,
             event_ms: 0,
+            waiting_calls: Default::default(),
+            awaiting_async_input: false,
         }
     }
     pub fn snapshot(&self) -> Snapshot {
@@ -284,6 +307,8 @@ impl Parser {
         self.data.truncated = true;
     }
     fn reset(&mut self) {
+        self.waiting_calls.clear();
+        self.awaiting_async_input=false;
         self.data.messages.clear();
         self.bytes = 0;
         self.user_hash = None;
@@ -387,17 +412,17 @@ impl Parser {
             MessageKind::Answer
         };
         if self.add(kind, text, at) && self.data.ended_at.is_none() {
-            self.before_start = false;
-            self.data.state = if kind == MessageKind::Answer {
+            let state = if kind == MessageKind::Answer {
                 AgentState::Answering
             } else {
                 AgentState::Working
             };
+            self.activity(state,at);
         }
     }
     fn activity(&mut self, state: AgentState, at: i64) {
         if self.data.ended_at.is_none() {
-            self.data.state = state;
+            self.data.state = if self.waiting_calls.is_empty() && !self.awaiting_async_input {state}else{AgentState::Waiting};
             self.before_start = false;
             self.touch(at);
         }
@@ -447,7 +472,7 @@ impl Parser {
                     if let Some(text) = p["last_agent_message"].as_str() {
                         self.add(MessageKind::Answer, text, at);
                     }
-                    self.data.state = AgentState::Completed;
+                    self.data.state = if self.awaiting_async_input {AgentState::Waiting}else{AgentState::Completed};
                     self.data.ended_at = Some(at);
                     self.before_start = false;
                     self.touch(at);
@@ -494,7 +519,23 @@ impl Parser {
                     ),
                     _ => {}
                 },
-                "function_call" | "custom_tool_call" => self.activity(AgentState::Working, at),
+                "function_call" | "custom_tool_call" => {
+                    let name=str_at(p,"name").rsplit('.').next().unwrap_or("");
+                    let call_id=str_at(p,"call_id");
+                    if name=="request_user_input" && !call_id.is_empty() && call_id.len() <= 256
+                        && self.waiting_calls.len() < MAX_MESSAGES && self.data.ended_at.is_none() {
+                        self.waiting_calls.insert(call_id.to_owned());
+                    }
+                    if name=="request_user_input_async" && self.data.ended_at.is_none() {
+                        self.awaiting_async_input=true;
+                    }
+                    self.activity(AgentState::Working,at);
+                },
+                "function_call_output" | "custom_tool_call_output" => {
+                    if self.waiting_calls.remove(str_at(p,"call_id")) {
+                        self.activity(AgentState::Working,at);
+                    }
+                },
                 "reasoning" => self.activity(AgentState::Thinking, at),
                 _ => {}
             },

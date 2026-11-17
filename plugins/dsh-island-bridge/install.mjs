@@ -18,7 +18,7 @@ export async function install({home=process.env.DSH_HOME??join(homedir(),'.dsh')
   const backup=`${patchPath}.win-island-${Date.now()}-${randomBytes(4).toString('hex')}.bak`;await copyFile(patchPath,backup);
   const replace=async text=>{const temporary=`${patchPath}.win-island-${process.pid}.tmp`;try{await writeFile(temporary,text);if(await readFile(patchPath,'utf8')!==original)throw new Error('DSH 配置已被更新，请重试安装');await rename(temporary,patchPath);}catch(error){await unlink(temporary).catch(()=>{});throw error;}};
   if(uninstall){await replace(clean.trim()?clean:'[]\n');return {profile,patchPath,backup,removed:true};}
-  const files=['index.mjs','adapter.mjs','bridge.mjs','package.json'];const contents=await Promise.all(files.map(name=>readFile(join(source,name))));
+  const files=['index.mjs','adapter.mjs','bridge.mjs','client.js','package.json'];const contents=await Promise.all(files.map(name=>readFile(join(source,name))));
   const hash=createHash('sha256');for(const bytes of contents)hash.update(bytes);const version=hash.digest('hex').slice(0,16);
   const destination=join(resolve(dataDir),'plugins','dsh-bridge',version);await mkdir(destination,{recursive:true});
   for(let i=0;i<files.length;i++)await writeFile(join(destination,files[i]),contents[i]);

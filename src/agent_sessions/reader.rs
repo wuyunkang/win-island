@@ -27,6 +27,7 @@ pub struct Update {
     pub error: Option<String>,
     pub dsh_status: String,
     pub ready: bool,
+    pub read_receipts: Vec<super::SessionReadReceipt>,
 }
 
 struct Cursor {
@@ -278,7 +279,10 @@ impl Reader {
         if !request.full || selected.is_none() {
             self.body = None;
         }
+        let receipt_ids:Vec<_>=recent.iter().chain(selected.iter()).map(|s|s.id.clone()).collect();
+        let read_receipts=super::read_receipts::load_with_ids(&self.root,&receipt_ids);
         for s in recent.iter_mut().chain(selected.iter_mut()) {
+            s.read_receipt=read_receipts.iter().find(|r|r.id==s.id).map(|r|r.receipt.clone());
             if let Some(title) = self.titles.get(&s.id) {
                 s.title = title.clone();
             }
@@ -311,6 +315,7 @@ impl Reader {
             error,
             dsh_status: String::new(),
             ready: true,
+            read_receipts,
         }
     }
 }

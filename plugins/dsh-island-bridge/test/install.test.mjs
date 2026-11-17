@@ -13,7 +13,7 @@ test('安装和更新保留其他配置，卸载只删除自有区块',async()=>
 test('代码更新更换 Cordis 条目，避免同一条目继续运行旧模块',async()=>{
   const root=await mkdtemp(join(tmpdir(),'island-dsh-update-'));const home=join(root,'dsh'),dataDir=join(root,'island'),source=join(root,'source');const patch=join(home,'profiles','desktop','cordis.patch.yml');
   await mkdir(join(home,'profiles','desktop'),{recursive:true});await mkdir(source);await writeFile(patch,'[]\n');
-  for(const name of ['index.mjs','adapter.mjs','bridge.mjs','package.json'])await copyFile(new URL(`../${name}`,import.meta.url),join(source,name));
+  for(const name of ['index.mjs','adapter.mjs','bridge.mjs','client.js','package.json'])await copyFile(new URL(`../${name}`,import.meta.url),join(source,name));
   try{
     const first=await install({home,dataDir,source});const before=await readFile(patch,'utf8');
     assert.match(before,new RegExp(`id: win-island-dsh-bridge-${first.version}\\b`));
