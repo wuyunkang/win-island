@@ -17,6 +17,10 @@ pub struct TransferUi {
     pub new_category: String,
     pub error: String,
     pub textures: HashMap<u64, egui::TextureHandle>,
+    file_types: crate::clipboard_icon::DirectoryCache,
+}
+impl TransferUi {
+    pub(crate) fn release_resources(&mut self){self.textures=HashMap::new();self.file_types.clear();}
 }
 fn photo(
     ui: &mut egui::Ui,
@@ -130,18 +134,23 @@ impl App {
         }
         if let Some(clip) = self.transfer_ui.detail.clone() {
             self.transfer_ui.textures.retain(|id, _| *id == clip.id);
+            let is_dir = if clip.files.len() == 1 {
+                self.transfer_ui.file_types.get(ui.ctx(), &clip.files[0])
+            } else { None };
+            let icon = crate::clipboard_icon::icon_for(clip.kind, &clip.files, is_dir);
             ui.horizontal(|ui| {
                 if ui.button("返回").clicked() {
                     self.transfer_ui.detail = None;
                 }
-                ui.strong(clip.kind.label());
+                crate::clipboard_icon::show(ui, icon);
+                ui.strong(icon.label());
                 if ui.button("粘贴").clicked() {
                     cmds.push(Cmd::PasteClip(clip.clone(), false));
                 }
                 if ui.button("只复制").clicked() {
                     cmds.push(Cmd::CopyClip(clip.clone(), false));
                 }
-                if clip.picture.is_none() && ui.button("编辑").clicked() {
+                if clip.picture.is_none() && clip.files.is_empty() && ui.button("编辑").clicked() {
                     self.transfer_ui.detail = None;
                     self.transfer_ui.edit = Some((clip.id, clip.text.clone()));
                 }
@@ -165,7 +174,10 @@ impl App {
                             clip.files.len()
                         ));
                         for path in &clip.files {
+                            let is_dir = self.transfer_ui.file_types.get(ui.ctx(), path);
+                            let icon = crate::clipboard_icon::icon_for(transfer::Kind::Files, std::slice::from_ref(path), is_dir);
                             ui.horizontal(|ui| {
+                                crate::clipboard_icon::show(ui, icon);
                                 ui.add(
                                     egui::Label::new(path.to_string_lossy())
                                         .selectable(true)
@@ -258,6 +270,7 @@ impl App {
                         },
                         c.at.clone(),
                         c.picture.clone(),
+                        c.files.iter().take(2).cloned().collect::<Vec<_>>(),
                     )
                 })
                 .collect()
@@ -268,8 +281,12 @@ impl App {
             .max_height(left.available_height())
             .show_rows(left, 18., entries.len(), |ui, range| {
                 for row in range {
-                    let (_index, id, kind, preview, pinned, source, at, picture) = &entries[row];
+                    let (_index, id, kind, preview, pinned, source, at, picture, files) = &entries[row];
                     visible.insert(*id);
+                    let is_dir = if files.len() == 1 {
+                        self.transfer_ui.file_types.get(ui.ctx(), &files[0])
+                    } else { None };
+                    let icon = crate::clipboard_icon::icon_for(*kind, files, is_dir);
                     let r = egui::Frame::new()
                         .fill(Color32::from_gray(25))
                         .corner_radius(7.)
@@ -296,11 +313,10 @@ impl App {
                                         );
                                     }
                                 } else {
-                                    ui.label(
-                                        RichText::new(if *pinned { "★" } else { kind.label() })
-                                            .color(Color32::from_rgb(156, 185, 255))
-                                            .size(10.),
-                                    );
+                                    crate::clipboard_icon::show(ui, icon);
+                                }
+                                if *pinned {
+                                    ui.label(RichText::new("★").color(Color32::from_rgb(255, 205, 107)).size(9.));
                                 }
                                 let text = RichText::new(preview).size(11.5);
                                 ui.add(
@@ -319,7 +335,7 @@ impl App {
                         ui.id().with(("clip-entry", id)),
                         Sense::click_and_drag(),
                     );
-                    let hit = hit.on_hover_text(format!("{preview}\n{source} · {at}"));
+                    let hit = hit.on_hover_text(format!("{} · {preview}\n{source} · {at}",icon.label()));
                     if hit.clicked() {
                         if let Some(clip) = self.clipboard.lock().get_id(*id).cloned() {
                             cmds.push(Cmd::PasteClip(clip, false));

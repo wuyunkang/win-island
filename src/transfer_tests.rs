@@ -45,6 +45,40 @@ fn transfer_classifies_links_code_colors_and_plain_text() {
     );
     assert_eq!(classify("今天的会议"), Kind::Text);
 }
+
+#[test]
+fn clipboard_icons_distinguish_text_office_folders_and_archives() {
+    use crate::clipboard_icon::{icon_for,IconKind};
+    use std::path::PathBuf;
+    assert_eq!(icon_for(Kind::Text,&[],None),IconKind::Text);
+    assert_eq!(icon_for(Kind::Link,&[],None),IconKind::Link);
+    assert_eq!(icon_for(Kind::Code,&[],None),IconKind::Code);
+    for (name,expected) in [
+        ("项目计划.DOCX",IconKind::Word),("budget.xlsx",IconKind::Excel),
+        ("汇报.pptx",IconKind::PowerPoint),("backup.tar.gz",IconKind::Archive),
+        ("backup.7Z",IconKind::Archive),("report.pdf",IconKind::File),
+    ] {assert_eq!(icon_for(Kind::Files,&[PathBuf::from(name)],Some(false)),expected,"{name}");}
+    assert_eq!(icon_for(Kind::Files,&[PathBuf::from("看起来像.zip")],Some(true)),IconKind::Folder,"文件夹扩展名不能覆盖实际类型");
+    assert_eq!(icon_for(Kind::Files,&[PathBuf::from("无扩展名")],Some(false)),IconKind::File,"无扩展名的文件不是文件夹");
+    assert_eq!(icon_for(Kind::Files,&[PathBuf::from("one.docx"),PathBuf::from("two.zip")],None),IconKind::Files,"多文件记录应显示组合图标");
+    assert_eq!(icon_for(Kind::Files,&[PathBuf::from("离线.docx")],None),IconKind::Word,"文件暂时不可用时仍可按扩展名显示图标");
+}
+
+#[test]
+fn clipboard_icon_directory_lookup_uses_real_file_type() {
+    use std::time::{Duration,Instant};
+    let root=std::env::temp_dir().join(format!("island-clip-icon-{}",std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let folder=root.join("folder.zip");let file=root.join("no-extension");
+    std::fs::create_dir_all(&folder).unwrap();std::fs::write(&file,b"hello").unwrap();
+    let ctx=eframe::egui::Context::default();let mut cache=crate::clipboard_icon::DirectoryCache::default();
+    for (path,expected) in [(&folder,true),(&file,false)] {
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop {if let Some(actual)=cache.get(&ctx,path){assert_eq!(actual,expected);break;}
+            assert!(Instant::now()<deadline,"异步目录检查未完成");std::thread::sleep(Duration::from_millis(2));}
+    }
+    std::fs::remove_file(file).unwrap();std::fs::remove_dir(folder).unwrap();std::fs::remove_dir(root).unwrap();
+}
 #[test]
 fn transfer_rules_support_all_any_regex_domain_and_source() {
     let value = ItemInfo {

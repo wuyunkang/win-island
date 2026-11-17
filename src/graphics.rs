@@ -16,6 +16,12 @@ fn configured_renderer() -> eframe::Renderer {
         }
     }
 }
+fn memory_efficient_device(
+    mut descriptor: eframe::wgpu::DeviceDescriptor<'static>,
+) -> eframe::wgpu::DeviceDescriptor<'static> {
+    descriptor.memory_hints = eframe::wgpu::MemoryHints::MemoryUsage;
+    descriptor
+}
 fn options_for(
     mut options: eframe::NativeOptions,
     renderer: eframe::Renderer,
@@ -30,6 +36,9 @@ fn options_for(
                 eframe::wgpu::Backends::VULKAN
             };
             setup.power_preference = eframe::wgpu::PowerPreference::HighPerformance;
+            let descriptor = setup.device_descriptor.clone();
+            setup.device_descriptor =
+                std::sync::Arc::new(move |adapter| memory_efficient_device(descriptor(adapter)));
         }
     }
     options
@@ -61,6 +70,16 @@ pub fn run(
 mod tests {
     use super::*;
     #[test]
+    fn memory_efficient_device_keeps_features_and_rendering_limits() {
+        let mut descriptor = eframe::wgpu::DeviceDescriptor::default();
+        descriptor.label = Some("memory-test");
+        descriptor.required_limits.max_texture_dimension_2d = 8192;
+        let descriptor = memory_efficient_device(descriptor);
+        assert!(matches!(descriptor.memory_hints,eframe::wgpu::MemoryHints::MemoryUsage));
+        assert_eq!(descriptor.required_limits.max_texture_dimension_2d, 8192);
+        assert_eq!(descriptor.label, Some("memory-test"));
+    }
+    #[test]
     #[cfg(windows)]
     fn review_windows_prefers_direct3d_for_even_frame_delivery() {
         run(eframe::NativeOptions::default(), |options| {
@@ -73,7 +92,10 @@ mod tests {
                 setup.instance_descriptor.backends,
                 eframe::wgpu::Backends::DX12
             );
-            assert_eq!(setup.power_preference,eframe::wgpu::PowerPreference::HighPerformance);
+            assert_eq!(
+                setup.power_preference,
+                eframe::wgpu::PowerPreference::HighPerformance
+            );
             Ok(())
         })
         .unwrap();

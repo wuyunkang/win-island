@@ -6,9 +6,9 @@ use crate::{
 };
 use eframe::egui::Color32;
 pub(crate) const TAB_TOP: f32 = 34.0;
-pub(crate) const TAB_STEP: f32 = 28.0;
+pub(crate) const TAB_STEP: f32 = 22.0;
 pub(crate) const TAB_CENTER: f32 = 45.0;
-fn accent(page: usize) -> Color32 {
+pub(crate) fn accent(page: usize) -> Color32 {
     match page {
         0 => Color32::from_rgb(72, 183, 255),
         1 => Color32::from_rgb(255, 100, 116),
@@ -16,10 +16,11 @@ fn accent(page: usize) -> Color32 {
         4 => Color32::from_rgb(67, 214, 152),
         5 => Color32::from_rgb(85, 161, 255),
         6 => Color32::from_rgb(179, 132, 255),
+        9 => Color32::from_rgb(103, 221, 176),
         _ => Color32::from_rgb(87, 210, 222),
     }
 }
-fn icon(c: &Card, page: usize, x: f32, y: f32, ink: Color32) {
+pub(crate) fn icon(c: &Card, page: usize, x: f32, y: f32, ink: Color32) {
     match page {
         0 => paint::note(c, x, y, 16.0, ink),
         // 小尺寸使用等线宽图标，避免原大秒表的固定表冠挤到相邻入口。
@@ -71,6 +72,8 @@ fn icon(c: &Card, page: usize, x: f32, y: f32, ink: Color32) {
                 c.circle(x + dx, y + 3.0, 0.9, ink);
             }
         }
+        8 => { c.ring(x, y, 4.5, 1.3, ink); for (dx,dy) in [(0.0,-8.0),(0.0,8.0),(-8.0,0.0),(8.0,0.0)] { c.circle(x+dx,y+dy,1.0,ink); } }
+        9 => { c.stroke(x-7.0,y-6.0,14.0,10.0,2.0,1.2,ink);c.path(&[(x-5.0,y+1.0),(x-2.0,y-2.0),(x,y+1.0),(x+4.0,y-3.0)],1.2,ink);c.seg((x,y+4.0),(x,y+7.0),1.2,ink);c.seg((x-4.0,y+7.0),(x+4.0,y+7.0),1.2,ink); }
         _ => {}
     }
 }

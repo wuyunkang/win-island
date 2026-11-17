@@ -21,14 +21,14 @@ pub const SIDE_HALF_EXTENT: f32 = 150.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum SideItem {
-    Clock, Battery, Music, Focus, Bell,
+    Clock, Battery, Music, Focus, Bell, Weather, Ai(f32), Feature(usize),
     /// AI 额度：账号下标（None 为「+N」）与高度。
     Quota(usize, f32),
 }
 
 impl SideItem {
     fn height(self) -> f32 {
-        match self { Self::Clock => 32.0, Self::Battery => 20.0, Self::Music => 18.0, Self::Focus => 22.0, Self::Bell => 22.0, Self::Quota(_, h) => h }
+        match self { Self::Ai(h) => h, Self::Clock => 32.0, Self::Battery => 20.0, Self::Music => 18.0, Self::Focus => 22.0, Self::Bell => 22.0, Self::Weather => 34.0, Self::Feature(_) => 24.0, Self::Quota(_, h) => h }
     }
 }
 
@@ -38,11 +38,27 @@ impl App {
 
     /// 竖向胶囊里依次显示的内容。
     pub(crate) fn side_items(&self) -> Vec<SideItem> {
-        let mut items = vec![SideItem::Clock];
-        if self.settings.show_battery && self.resident_power.0.is_some() { items.push(SideItem::Battery); }
-        if self.media.is_music() { items.push(SideItem::Music); }
-        if self.pomo.running { items.push(SideItem::Focus); }
-        items.extend(self.quota_side_items().into_iter().map(|(index, h)| SideItem::Quota(index, h)));
+        use crate::bar_layout::{self as bar,BATTERY,CLOCK,WEATHER,MUSIC,FOCUS,QUOTA,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR};
+        let battery=self.settings.show_battery && self.resident_power.0.is_some();
+        let default=bar::default_order(battery);
+        let order=if bar::valid_order(&self.settings.resident_order){bar::complete_order(&self.settings.resident_order)}else{default.to_vec()};
+        let mut items=Vec::new();
+        for slot in order {
+            match slot {
+                CLOCK=>items.push(SideItem::Clock),
+                BATTERY if battery=>items.push(SideItem::Battery),
+                WEATHER if self.capsule_enabled(8)=>items.push(SideItem::Weather),
+                MUSIC if self.media.is_music() && self.capsule_enabled(0)=>items.push(SideItem::Music),
+                FOCUS if self.pomo.running && self.capsule_enabled(1)=>items.push(SideItem::Focus),
+                bar::AGENT if self.ai_capsule_chip()=>items.push(SideItem::Ai(self.ai.capsule_height(self.t))),
+                QUOTA=>items.extend(self.quota_side_items().into_iter().map(|(index,h)|SideItem::Quota(index,h))),
+                CLIPBOARD|TODO|MAIL|CALENDAR|MONITOR=>{
+                    let page=match slot {CLIPBOARD=>3,TODO=>4,MAIL=>5,MONITOR=>9,_=>7};
+                    if self.capsule_enabled(page){items.push(SideItem::Feature(page));}
+                },
+                _=>{},
+            }
+        }
         if self.t < self.notification_bell_until { items.push(SideItem::Bell); }
         items
     }
@@ -135,7 +151,15 @@ impl App {
                     c.circle(cx, mid - 5.0, 3.0, color);
                     c.text(cx, mid + 9.0, &format!("{minutes}′"), size::TINY, W::Semibold, theme::WHITE, H::Center);
                 }
+                SideItem::Weather => self.weather.draw_side(c,cx,mid,self.settings.weather_fahrenheit),
+                SideItem::Feature(9) => {
+                    c.text(cx,mid-1.,&crate::system_monitor::percent(self.monitor.sample.cpu),8.,W::Semibold,theme::WHITE,H::Center);
+                    c.text(cx,mid+8.,"CPU",6.5,W::Regular,theme::GRAY,H::Center);
+                    if c.hit(cx-14.,mid-12.,28.,24.,"side-monitor").on_hover_text(format!("CPU {} · 内存 {}",crate::system_monitor::percent(self.monitor.sample.cpu),crate::system_monitor::percent(self.monitor.sample.memory_percent()))).clicked(){self.show_page(9);}
+                },
+                SideItem::Feature(page) => self.draw_capsule_feature(c,page,cx,mid,&env.today),
                 SideItem::Quota(index, h) => self.draw_quota_side(c, cx, mid, h, index),
+                SideItem::Ai(_) => self.draw_ai_chip(c,cx,mid,34.,true),
                 SideItem::Bell => {
                     paint::bell(&c.scaled(cx, mid, 1.1), cx, mid, theme::WHITE, paint::bell_swing(self.t - self.notification_bell_at));
                     c.circle(cx + 4.0, mid - 4.5, 2.0, Color32::from_rgb(255, 72, 72));

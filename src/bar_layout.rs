@@ -11,11 +11,37 @@ pub(crate) const MUSIC: usize = 6;
 pub(crate) const FOCUS: usize = 7;
 pub(crate) const BELL: usize = 8;
 pub(crate) const PET: usize = 9;
-const WIDTHS: [f32; 10] = [44.0,20.0,27.0,27.0,27.0,22.0,14.0,crate::focus_bar::WIDTH,20.0,32.0];
+pub(crate) const WEATHER: usize = 10;
+pub(crate) const CLIPBOARD: usize = 11;
+pub(crate) const TODO: usize = 12;
+pub(crate) const MAIL: usize = 13;
+pub(crate) const CALENDAR: usize = 14;
+pub(crate) const MONITOR: usize = 15;
+pub(crate) const AGENT: usize = 16;
+const WIDTHS: [f32; 17] = [44.0,20.0,27.0,27.0,27.0,22.0,14.0,crate::focus_bar::WIDTH,20.0,32.0,64.0,38.0,38.0,38.0,38.0,72.0,27.0];
 
-pub(crate) const DEFAULT_ORDER: [usize;6]=[BATTERY,PET,CLOCK,QUOTA,MUSIC,FOCUS];
+pub(crate) const DEFAULT_ORDER: [usize;13]=[BATTERY,PET,CLOCK,WEATHER,AGENT,QUOTA,MUSIC,FOCUS,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR];
+pub(crate) fn default_order(battery:bool)->[usize;13] {
+    if battery {DEFAULT_ORDER}else{[AGENT,QUOTA,PET,CLOCK,WEATHER,BATTERY,MUSIC,FOCUS,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR]}
+}
 pub(crate) fn valid_order(order:&[usize])->bool {
-    order.len()==6 && DEFAULT_ORDER.iter().all(|slot|order.iter().filter(|value|*value==slot).count()==1)
+    let required:&[usize]=match order.len() {
+        6=>&[BATTERY,PET,CLOCK,QUOTA,MUSIC,FOCUS],
+        7=>&[BATTERY,PET,CLOCK,WEATHER,QUOTA,MUSIC,FOCUS],
+        11=>&[BATTERY,PET,CLOCK,WEATHER,QUOTA,MUSIC,FOCUS,CLIPBOARD,TODO,MAIL,CALENDAR],
+        12=>&[BATTERY,PET,CLOCK,WEATHER,QUOTA,MUSIC,FOCUS,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR],
+        13=>&DEFAULT_ORDER,
+        _=>return false,
+    };
+    required.iter().all(|slot|order.iter().filter(|value|*value==slot).count()==1)
+}
+pub(crate) fn complete_order(order:&[usize])->Vec<usize> {
+    let mut result=if valid_order(order){order.to_vec()}else{DEFAULT_ORDER.to_vec()};
+    for slot in DEFAULT_ORDER {if !result.contains(&slot){
+        if slot==AGENT {let position=result.iter().position(|s|*s==QUOTA).unwrap_or(result.len());result.insert(position,slot);}
+        else {result.push(slot);}
+    }}
+    result
 }
 
 pub(crate) fn animations_enabled()->bool {
@@ -68,9 +94,19 @@ impl Layout {
         for value in x.iter_mut().flatten() {*value-=width/2.0;}
         Self {width:width.max(96.0),x,widths,quotas}
     }
+    pub fn add_weather(&mut self) {self.add_feature(WEATHER);}
+    pub fn add_feature(&mut self,slot:usize) {
+        if self.x[slot].is_some(){return;}
+        let added=WIDTHS[slot]+12.0;
+        for x in self.x.iter_mut().flatten(){*x-=added/2.0;}
+        self.x[slot]=Some(self.width/2.0-10.0);
+        self.width+=added;
+    }
     pub fn quota_slots(&self)->impl Iterator<Item=usize> { (0..self.quotas).map(quota_slot) }
     pub fn balance_tail(&mut self,position:usize,extra:f32){
-        let slot=quota_slot(position);
+        self.widen_slot(quota_slot(position),extra);
+    }
+    pub fn widen_slot(&mut self,slot:usize,extra:f32){
         let Some(center)=self.x[slot] else{return;};
         for (i,x) in self.x.iter_mut().enumerate(){if i!=slot{if let Some(x)=x{*x+=if *x<center{-extra/2.0}else{extra/2.0};}}}
         self.widths[slot]+=extra;self.width+=extra;
@@ -85,7 +121,7 @@ impl Layout {
     pub fn reorder(&mut self,order:&[usize]) {
         if !valid_order(order){return;}
         let original=self.x.clone();let mut cursor=-self.width/2.0+16.0;
-        for slot in order.iter().copied().chain(std::iter::once(BELL)) {
+        for slot in complete_order(order).into_iter().chain(std::iter::once(BELL)) {
             let slots:Vec<usize>=if slot==QUOTA{self.quota_slots().collect()}else{vec![slot]};
             let left=slots.iter().filter_map(|&i|original[i].map(|x|x-self.widths[i]/2.0)).fold(f32::INFINITY,f32::min);
             let right=slots.iter().filter_map(|&i|original[i].map(|x|x+self.widths[i]/2.0)).fold(f32::NEG_INFINITY,f32::max);
@@ -97,7 +133,7 @@ impl Layout {
     /// 圆环换边经过时钟时，暂时淡出时钟，避免移动中相互遮挡。
     pub fn clearance(&self,slot:usize)->f32 {
         let Some(x)=self.x[slot] else{return 0.0;};
-        let distance=self.quota_slots().filter_map(|i|self.x[i].map(|other|(other-x).abs()-(self.widths[i]-27.0)/2.0)).fold(f32::INFINITY,f32::min);
+        let distance=self.quota_slots().chain(std::iter::once(AGENT)).filter_map(|i|self.x[i].map(|other|(other-x).abs()-(self.widths[i]-27.0)/2.0)).fold(f32::INFINITY,f32::min);
         let quota=if slot==CLOCK {smoothstep(34.0,44.0,distance)}else{smoothstep(22.0,34.0,distance)};
         quota*self.pet_clearance(slot)
     }
@@ -141,7 +177,7 @@ impl Motion {
 mod tests {
     use super::*;
     #[test] fn deepseek_balance_follows_more_and_never_overlaps(){
-        for order in [DEFAULT_ORDER,[FOCUS,MUSIC,QUOTA,CLOCK,PET,BATTERY]] {for quotas in 1..=6 {for battery in [false,true]{
+        for order in [DEFAULT_ORDER,[FOCUS,MUSIC,AGENT,QUOTA,CLOCK,PET,BATTERY,WEATHER,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR]] {for quotas in 1..=6 {for battery in [false,true]{
             let mut layout=Layout::new(battery,quotas,true,true,false,true);layout.reorder(&order);layout.balance_tail(quotas-1,76.0);layout.widen_clock(40.0);
             let mut boxes:Vec<_>=layout.x.iter().enumerate().filter_map(|(i,x)|x.map(|x|{let width=layout.widths[i]+if i==CLOCK{40.0}else{0.0};(x-width/2.0,x+width/2.0)})).collect();boxes.sort_by(|a,b|a.0.total_cmp(&b.0));
             assert!(boxes.windows(2).all(|p|p[1].0-p[0].1>=6.9));assert!(boxes.last().unwrap().1<=layout.width/2.0-15.9);
@@ -150,7 +186,7 @@ mod tests {
     }
     #[test]
     fn clock_12h_keeps_components_separate_in_custom_orders(){
-        for order in [DEFAULT_ORDER,[FOCUS,MUSIC,QUOTA,CLOCK,PET,BATTERY]] {
+        for order in [DEFAULT_ORDER,[FOCUS,MUSIC,AGENT,QUOTA,CLOCK,PET,BATTERY,WEATHER,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR]] {
             for quotas in 0..=5 {
                 let mut layout=Layout::new(true,quotas,true,true,false,true);
                 layout.reorder(&order);layout.widen_clock(40.0);
@@ -169,7 +205,7 @@ mod tests {
     fn custom_order_preserves_groups_and_hidden_positions(){
         assert!(!valid_order(&[0,0,2,6,7,9]));
         assert!(!valid_order(&[0,1,2]));
-        let order=[FOCUS,MUSIC,QUOTA,CLOCK,PET,BATTERY];
+        let order=[FOCUS,MUSIC,QUOTA,CLOCK,PET,BATTERY,WEATHER,CLIPBOARD,TODO,MAIL,CALENDAR,MONITOR];
         for battery in [false,true]{for count in 0..=5 {
             let mut layout=Layout::new(battery,count,true,true,false,true);
             let width=layout.width;layout.reorder(&order);
@@ -204,5 +240,22 @@ mod tests {
         for _ in 0..120 {motion.step(after.clone(),1.0/60.0,true);}
         assert!((motion.current().x[QUOTA].unwrap()-after.x[QUOTA].unwrap()).abs()<0.01);
         motion.step(before.clone(),1.0/60.0,false);assert_eq!(motion.current().x,before.x);
+    }
+}
+
+#[cfg(test)]
+mod weather_layout_tests {
+    use super::*;
+    #[test]
+    fn weather_fits_inside_bar_with_default_and_custom_orders() {
+        for battery in [false,true] {for quotas in [0,1,3,5] {for custom in [false,true] {
+            let mut layout=Layout::new(battery,quotas,false,false,false,false);
+            layout.add_weather();
+            if custom {layout.reorder(&DEFAULT_ORDER);}
+            let mut boxes:Vec<_>=layout.x.iter().enumerate().filter_map(|(i,x)|x.map(|x|(x-layout.widths[i]/2.0,x+layout.widths[i]/2.0))).collect();
+            boxes.sort_by(|a,b|a.0.total_cmp(&b.0));
+            assert!(boxes.windows(2).all(|p|p[1].0-p[0].1>=6.9),"组件不应重叠：{boxes:?}");
+            assert!(boxes.first().unwrap().0>=-layout.width/2.0+7.0 && boxes.last().unwrap().1<=layout.width/2.0-7.0,"天气必须留在岛体内：{layout:?}");
+        }}}
     }
 }

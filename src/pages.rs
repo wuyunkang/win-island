@@ -163,7 +163,7 @@ impl App {
             let id=egui::Id::new("music-lyrics-scroll");
             if !self.ly.scroll_animation_started {
                 c.ui.ctx().animate_value_with_time(id,target as f32,0.0);
-                self.ly.scroll_animation_started=true;
+                if c.live {self.ly.scroll_animation_started=true;}
             }
             let position=c.ui.ctx().animate_value_with_time(id,target as f32,0.3);
             let first=(position.floor() as usize).saturating_sub(2);
@@ -588,7 +588,7 @@ impl App {
             return;
         }
 
-        self.mail_manage_tick();
+        if c.live {self.mail_manage_tick();}
         // v0.5.5：点开某封邮件 → 整块换成正文摘要，左上「返回」回到列表。
         if let Some((account, uid)) = self.mail.open_uid.clone() {
             match self.mail_rows()
@@ -600,7 +600,7 @@ impl App {
                     self.mail_detail(c, &item, cmds);
                     return;
                 }
-                None => self.mail.open_uid = None,
+                None => if c.live {self.mail.open_uid = None},
             }
         }
         let code=self.visible_mail_code().cloned();

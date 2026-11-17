@@ -30,7 +30,7 @@ struct Shell {
     _resource_monitor:Option<island::resources::Monitor>,
     resource_at:PollClock,
     guard_notified:bool,
-    media_enabled: smtc::Poller,
+    media_enabled: Option<smtc::Poller>,
     placed: bool,
     placement_at: PollClock,
     placement_scale: f32,
@@ -82,7 +82,7 @@ struct Shell {
     /// v0.5.6：日程（CalDAV）服务与上次下发的配置。
     cal: island::calendar::Service,
     cal_sig: (Vec<island::calendar::Config>, bool),
-    quota: island::quota::Service,
+    quota: Option<island::quota::Service>,
     quota_sig: Option<(bool,Vec<island::quota::Account>)>,
     quota_at: PollClock,
 }
@@ -92,6 +92,7 @@ impl Shell {
         diagnostics::graphics(cc);
         diagnostics::startup("加载本地配置");
         let mut app = App::new(&cc.egui_ctx, Options::default());
+        cc.egui_ctx.options_mut(|options|options.reduce_texture_memory=true);
         if std::env::args().any(|arg|arg=="--activity-api"){app.settings.live_api=true;}
         #[cfg(feature="record")] let quota_demo=std::env::var("DAOZAI_QUOTA_DEMO").is_ok();
         #[cfg(not(feature="record"))] let quota_demo=false;
@@ -100,6 +101,7 @@ impl Shell {
         diagnostics::startup("启动剪贴板记录");
         {let ctx=cc.egui_ctx.clone();island::clipboard::watch(app.clipboard.clone(),move||ctx.request_repaint());}
         if std::env::args().any(|arg|arg=="--settings"){app.open_settings();}
+        if std::env::args().any(|arg|arg=="--ai-settings"){app.open_ai_settings();}
         if std::env::args().any(|arg|arg=="--calendar"){app.open_calendar(None);}
         #[cfg(feature="record")]
         if std::env::var("DAOZAI_MAIL_DEMO").is_ok(){app.mail_demo();}
@@ -109,8 +111,7 @@ impl Shell {
         if let Ok(mode)=std::env::var("DAOZAI_QUOTA_DEMO"){app.quota_demo(&mode);}
         diagnostics::startup("初始化媒体和托盘");
         let media = smtc::shared();
-        let media_enabled=smtc::spawn_poller(media.clone(),cc.egui_ctx.clone());
-        media_enabled.store(app.settings.visible_pages[0],std::sync::atomic::Ordering::Relaxed);
+        let media_enabled=app.music_polling_needed().then(||smtc::spawn_poller(media.clone(),cc.egui_ctx.clone()));
         #[cfg(windows)]
         let autostart = island::tray::autostart_enabled();
         #[cfg(windows)]
@@ -181,7 +182,7 @@ impl Shell {
             mail_sig: (false, 0, Vec::new()),
             cal: island::calendar::Service::start(),
             cal_sig: (Vec::new(), true),
-            quota: island::quota::Service::start(), quota_sig: None, quota_at: PollClock::default(),
+            quota: None, quota_sig: None, quota_at: PollClock::default(),
         }
     }
 
@@ -311,7 +312,13 @@ impl eframe::App for Shell {
             self.guard_notified=true;self.app.opts.fetch_lyrics=false;
             self.app.alert("灵动岛已暂停音乐功能","检测到资源占用异常，已暂停读取音乐信息和歌词。重启灵动岛即可恢复；诊断记录在数据目录的 diagnostics 文件夹。",0,false);
         }
-        self.media_enabled.store(self.app.settings.visible_pages[0] && !guarded,std::sync::atomic::Ordering::Relaxed);
+        let media_needed=self.app.music_polling_needed()&&!guarded;
+        if !media_needed {
+            self.media_enabled=None;self.media_control=None;self.seek_rx=None;
+            if let Ok(mut media)=self.media.lock(){*media=Default::default();}
+        }else if self.media_enabled.is_none()&&island::resources::POLLER.active()==0 {
+            self.media_enabled=Some(smtc::spawn_poller(self.media.clone(),ctx.clone()));
+        }
         // 设置里改了岛体大小：下一帧起主窗口按新倍率栅格化，定位逻辑随像素比变化同步调整画布。
         #[cfg(windows)] eframe::set_root_viewport_scale(self.app.settings.island_scale());
         #[cfg(windows)]
@@ -472,6 +479,9 @@ impl eframe::App for Shell {
             }
         }
         let env = self.env(ctx);
+        let mut agent_visible=!ctx.input(|i|i.viewport().minimized.unwrap_or(false));
+        #[cfg(windows)] {agent_visible&=!self.hidden;}
+        self.app.agent_tick(ctx,agent_visible&&!guarded);
         // v0.5.5 邮件：开关 / 间隔 / 账号清单变了就重新对齐收信线程，再把事件交给界面。
         let sig=(self.app.settings.mail_enabled,self.app.settings.mail_interval,self.app.mail_accounts().to_vec());
         if sig!=self.mail_sig{
@@ -495,13 +505,16 @@ impl eframe::App for Shell {
         while let Some(ev)=self.cal.try_recv(){self.app.calendar_event(ev);}
         #[cfg(feature="record")] let quota_demo=std::env::var("DAOZAI_QUOTA_DEMO").is_ok();
         #[cfg(not(feature="record"))] let quota_demo=false;
-        if !quota_demo {
+        if !quota_demo && self.app.quota_polling_needed() {
             let config=self.app.quota_config();let sig=(config.enabled,config.accounts.iter().cloned().map(|mut a|{a.alias.clear();a.pinned=false;a}).collect::<Vec<_>>());
             if self.quota_sig.as_ref()!=Some(&sig) || self.quota_at.ready(Duration::from_secs(180)){
                 let accounts:Vec<_>=sig.1.iter().filter(|a|sig.0 && a.enabled).cloned().collect();
-                if self.quota.refresh(accounts.clone()){self.app.quota_pending(&accounts);self.quota_sig=Some(sig);self.quota_at=PollClock::now();}
+                if accounts.is_empty(){self.quota=None;self.quota_sig=Some(sig);self.quota_at=PollClock::now();}
+                else if self.quota.get_or_insert_with(island::quota::Service::start).refresh(accounts.clone()){self.app.quota_pending(&accounts);self.quota_sig=Some(sig);self.quota_at=PollClock::now();}
             }
-            while let Some(ev)=self.quota.try_recv(self.app.quota_config()){self.app.quota_event(ev);}
+            if let Some(quota)=&self.quota{while let Some(ev)=quota.try_recv(self.app.quota_config()){self.app.quota_event(ev);}}
+        }else if !quota_demo {
+            self.quota=None;self.quota_sig=None;self.app.quota_idle();
         }
         let mut out = None;
         egui::CentralPanel::default()
@@ -572,10 +585,14 @@ impl eframe::App for Shell {
                 Cmd::QuotaChooseFile=>{
                     #[cfg(windows)] match island::system::pick_files_for("选择 AI 账号的登录 JSON 文件",false){Ok(files)=>if let Some(path)=files.into_iter().next(){self.app.quota_set_source(path);},Err(_)=>self.app.say("无法选择登录文件")}
                 },
+                Cmd::AgentReturn(source)=>{if let Err(error)=island::agent_sessions::activate_desktop_for(source){self.app.say(error);}},
+                Cmd::AgentChooseDirectory=>{
+                    #[cfg(windows)] match island::system::pick_directory_for("选择 Codex 数据目录（包含 sessions）"){Ok(Some(path))=>self.app.agent_set_directory(path),Ok(None)=>{},Err(_)=>self.app.say("无法选择会话目录")}
+                },
                 Cmd::QuotaRefresh=>{
                     if self.quota_at.ready(Duration::from_secs(15)) {
                         let config=self.app.quota_config();let accounts:Vec<_>=config.accounts.iter().filter(|a|config.enabled && a.enabled).cloned().collect();
-                        if self.quota.refresh(accounts.clone()){self.app.quota_pending(&accounts);self.quota_at=PollClock::now();}
+                        if !accounts.is_empty()&&self.quota.get_or_insert_with(island::quota::Service::start).refresh(accounts.clone()){self.app.quota_pending(&accounts);self.quota_at=PollClock::now();}
                     }else{self.app.say("请稍后再刷新");}
                 },
                 Cmd::QuotaConnected=>{self.quota_sig=None;},

@@ -1,0 +1,67 @@
+name: 发布 Windows 便携版
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - app.rc
+      - .github/workflows/release.yml
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: release-windows
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      CARGO_BUILD_JOBS: 1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: 确定版本与发布状态
+        id: version
+        shell: pwsh
+        run: |
+          $version = ((Get-Content Cargo.toml | Select-String '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value)
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw '版本号无效' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          $existing = gh release list --json tagName --jq ".[] | select(.tagName == `"v$version`") | .tagName"
+          if ($LASTEXITCODE -ne 0) { throw '无法检查现有 Release' }
+          "publish=$([string]::IsNullOrWhiteSpace($existing).ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+      - name: 安装 Rust stable
+        if: steps.version.outputs.publish == 'true'
+        run: rustup toolchain install stable --profile minimal
+      - name: Rust 回归
+        if: steps.version.outputs.publish == 'true'
+        run: cargo +stable test --locked --workspace --all-targets --features record --target x86_64-pc-windows-msvc -- --test-threads=1
+      - name: DSH 桥接回归
+        if: steps.version.outputs.publish == 'true'
+        run: node --test plugins/dsh-island-bridge/test/*.test.mjs
+      - name: 生成便携包
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        run: ./scripts/package-portable.ps1
+      - name: 发布 Release 与校验文件
+        if: steps.version.outputs.publish == 'true'
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $version = $env:RELEASE_VERSION
+          $lines = Get-Content CHANGELOG.md
+          $start = ($lines | Select-String "^## 灵动岛 v$([regex]::Escape($version))" | Select-Object -First 1).LineNumber
+          if (-not $start) { throw '缺少当前版本的更新说明' }
+          $notes = @()
+          for ($i = $start; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '^## ') { break }
+            if ($lines[$i] -eq '以下保留上游历史更新记录。') { break }
+            $notes += $lines[$i]
+          }
+          $notes | Set-Content -LiteralPath release-notes.md -Encoding utf8
+          gh release create "v$version" "dist/LingDongIsland-$version-windows-x64.zip" "dist/LingDongIsland-$version-windows-x64.zip.sha256" --target $env:GITHUB_SHA --title "灵动岛 v$version" --notes-file release-notes.md --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release 发布失败' }

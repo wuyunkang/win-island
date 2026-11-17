@@ -1,6 +1,6 @@
 [package]
 name = "win-island-rust"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 description = "灵动岛：原生 Rust 桌面通知与中转站"
@@ -80,6 +80,10 @@ windows = { version = "0.58", features = [
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Performance",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_NetworkManagement_Ndis",
   "Win32_Storage_FileSystem",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_Input_Ime", "Win32_UI_TextServices",

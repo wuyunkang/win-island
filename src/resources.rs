@@ -30,6 +30,9 @@ pub static NATIVE_LYRICS:Lane=Lane::new("island-native-lyrics",2);
 pub static CONTROL:Lane=Lane::new("island-control",1);
 pub static ASYNC:Lane=Lane::new("winrt-request",4);
 pub static ASYNC_ARTWORK:Lane=Lane::new("winrt-artwork",2);
+pub static SYSTEM_MONITOR:Lane=Lane::new("island-monitor",1);
+pub static WEATHER:Lane=Lane::new("island-weather",1);
+pub static AGENT_SESSION:Lane=Lane::new("island-agent",1);
 static MONITOR:Lane=Lane::new("island-diagnostics",1);
 pub static TIMEOUTS:AtomicUsize=AtomicUsize::new(0);
 pub static REJECTED_DATA:AtomicUsize=AtomicUsize::new(0);
@@ -132,7 +135,7 @@ fn record(value:Snapshot)->String {
     let mut line=format!("time={now} build={} pid={} private={} working={} handles={} threads={} abnormal={} timeouts={} rejected_data={} control_dropped={} textures={} texture_bytes={} galleys={}",
         option_env!("DAOZAI_BUILD_LABEL").or(option_env!("CARGO_PKG_VERSION")).unwrap_or("test"),std::process::id(),value.private_bytes,value.working_bytes,value.handles,value.threads,value.abnormal(),
         TIMEOUTS.load(Ordering::Relaxed),REJECTED_DATA.load(Ordering::Relaxed),CONTROL_DROPPED.load(Ordering::Relaxed),TEXTURES.load(Ordering::Relaxed),TEXTURE_BYTES.load(Ordering::Relaxed),GALLEYS.load(Ordering::Relaxed));
-    for lane in [&POLLER,&ARTWORK,&COVER,&LYRICS,&NATIVE_LYRICS,&CONTROL,&ASYNC,&ASYNC_ARTWORK,&MONITOR] {
+    for lane in [&POLLER,&ARTWORK,&COVER,&LYRICS,&NATIVE_LYRICS,&CONTROL,&ASYNC,&ASYNC_ARTWORK,&MONITOR,&SYSTEM_MONITOR,&WEATHER,&AGENT_SESSION] {
         let _=write!(line," {}={}/{}/{}/{}",lane.name,lane.active(),lane.limit,lane.started.load(Ordering::Relaxed),lane.denied.load(Ordering::Relaxed));
     }
     line.push('\n');line

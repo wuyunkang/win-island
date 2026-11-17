@@ -53,7 +53,7 @@ impl Cache {
         self.entries.retain(|path,_|paths.contains(path));self.pending.retain(|path|paths.contains(path));
     }
     pub fn remove(&mut self,path:&Path){self.entries.remove(path);self.pending.remove(path);}
-    pub fn clear(&mut self){self.entries.clear();self.pending.clear();}
+    pub fn clear(&mut self){*self=Self::default();}
 }
 
 fn load_preview(path:&Path)->Loaded {
@@ -259,6 +259,7 @@ mod tests {
         assert_eq!(cache.entries.len(),32);
         assert!(ctx.tex_manager().read().num_allocated()<=33,"滚动大量文件不能无限保留 GPU 缩略图");
         cache.clear();
+        assert!(cache.worker.is_none(),"关闭预览后应释放缩略图工作线程的通道");
         assert!(ctx.tex_manager().read().num_allocated()<=1,"清空置物架后应释放缩略图纹理");
     }
 }

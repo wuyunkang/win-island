@@ -273,6 +273,7 @@ fn credentials(provider:Provider,path:&Path)->Result<Credential,String>{
 }
 pub struct Event {pub id:String,pub result:Result<Snapshot,String>}
 pub struct Service {
+    stop:std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx:mpsc::SyncSender<Vec<Account>>,
     rx:mpsc::Receiver<(Account,Result<Snapshot,String>)>,
 }
@@ -280,9 +281,11 @@ impl Service {
     pub fn start()->Self{
         let(tx,requests)=mpsc::sync_channel::<Vec<Account>>(1);
         let(results,rx)=mpsc::channel();
+        let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));let stopped=stop.clone();
         std::thread::spawn(move||{
             let mut cooldowns:HashMap<_,(Instant,String)>=HashMap::new();
             while let Ok(accounts)=requests.recv(){
+                if stopped.load(std::sync::atomic::Ordering::Acquire){break;}
                 let agent=http_agent();
                 let mut groups=[Vec::new(),Vec::new(),Vec::new()];
                 for a in accounts.into_iter().filter(|a|a.enabled){
@@ -299,9 +302,11 @@ impl Service {
                     let mut workers=Vec::new();
                     for group in groups.into_iter().filter(|g|!g.is_empty()){
                         let agent=&agent;let results=&results;
+                        let stopped=&stopped;
                         workers.push(scope.spawn(move||{
                             let mut waits=Vec::new();
                             for (key,a) in group{
+                                if stopped.load(std::sync::atomic::Ordering::Acquire){break;}
                                 let result=fetch(agent,&a);
                                 if let Err((message,wait))=&result{
                                     if *wait>0 {waits.push((key,(Instant::now()+Duration::from_secs(*wait),message.clone())));}
@@ -314,7 +319,7 @@ impl Service {
                     for worker in workers{if let Ok(waits)=worker.join(){cooldowns.extend(waits);}}
                 });
             }
-        });Self{tx,rx}
+        });Self{tx,rx,stop}
     }
     pub fn refresh(&self,accounts:Vec<Account>)->bool{self.tx.try_send(accounts).is_ok()}
     pub fn try_recv(&self,config:&Config)->Option<Event>{
@@ -326,6 +331,7 @@ impl Service {
         None
     }
 }
+impl Drop for Service{fn drop(&mut self){self.stop.store(true,std::sync::atomic::Ordering::Release);}}
 fn http_agent()->ureq::Agent{
     let mut builder=ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0);
     let proxy=["HTTPS_PROXY","https_proxy","ALL_PROXY","all_proxy","HTTP_PROXY","http_proxy"].iter().find_map(|key|std::env::var(key).ok().filter(|s|!s.is_empty())).or_else(system_proxy);

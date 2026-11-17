@@ -9,16 +9,24 @@ pub enum PanelTheme {
     GitHubDark,
     GitHubLight,
     Dracula,
+    NightOwl,
+    Cyberpunk,
+    IslandHoliday,
+    Nord,
     Custom,
 }
 impl PanelTheme {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 11] = [
         Self::Dark,
         Self::Light,
         Self::OneDark,
         Self::GitHubDark,
         Self::GitHubLight,
         Self::Dracula,
+        Self::NightOwl,
+        Self::Cyberpunk,
+        Self::IslandHoliday,
+        Self::Nord,
         Self::Custom,
     ];
     pub fn label(self) -> &'static str {
@@ -29,7 +37,26 @@ impl PanelTheme {
             Self::GitHubDark => "GitHub Dark",
             Self::GitHubLight => "GitHub Light",
             Self::Dracula => "Dracula",
+            Self::NightOwl => "Night Owl",
+            Self::Cyberpunk => "赛博霓虹",
+            Self::IslandHoliday => "海岛假日",
+            Self::Nord => "Nord 极地",
             Self::Custom => "自定义",
+        }
+    }
+    pub fn description(self)->&'static str {
+        match self {
+            Self::Dark=>"纯黑背景 · 清晰的系统蓝",
+            Self::Light=>"柔白背景 · 适合明亮桌面",
+            Self::OneDark=>"石墨灰 · 柔和蓝色",
+            Self::GitHubDark=>"深邃墨色 · 通透蓝色",
+            Self::GitHubLight=>"纯白底色 · 鲜明蓝色",
+            Self::Dracula=>"午夜紫灰 · 薰衣草紫",
+            Self::NightOwl=>"深海蓝 · 温柔的薄荷绿",
+            Self::Cyberpunk=>"暗紫背景 · 明亮霓虹粉",
+            Self::IslandHoliday=>"奶油白 · 热带青绿",
+            Self::Nord=>"极地灰蓝 · 冰川青色",
+            Self::Custom=>"自由组合背景、文字和强调色",
         }
     }
 }
@@ -79,15 +106,7 @@ impl Appearance {
         settings_label(ui, "主题与文字");
         settings_card(ui, |ui| {
             row(ui, "面板主题", |ui| {
-                ComboBox::from_id_salt("panel-theme")
-                    .selected_text(self.theme.label())
-                    .width(165.)
-                    .show_ui(ui, |ui| {
-                        for theme in PanelTheme::ALL {
-                            ui.selectable_value(&mut self.theme, theme, theme.label());
-                        }
-                    })
-                    .response
+                ui.label(self.theme.label())
             });
             if self.theme == PanelTheme::Custom {
                 for (label, value) in [
@@ -193,6 +212,10 @@ impl Appearance {
             PanelTheme::GitHubDark => ([13, 17, 23], [230, 237, 243], [88, 166, 255]),
             PanelTheme::GitHubLight => ([255, 255, 255], [31, 35, 40], [9, 105, 218]),
             PanelTheme::Dracula => ([40, 42, 54], [248, 248, 242], [189, 147, 249]),
+            PanelTheme::NightOwl => ([1, 22, 39], [214, 222, 235], [127, 219, 202]),
+            PanelTheme::Cyberpunk => ([25, 17, 39], [249, 241, 255], [255, 100, 213]),
+            PanelTheme::IslandHoliday => ([255, 248, 233], [42, 60, 58], [14, 128, 119]),
+            PanelTheme::Nord => ([46, 52, 64], [236, 239, 244], [136, 192, 208]),
             PanelTheme::Custom => (
                 crate::transfer::color(&self.background).unwrap_or([22, 22, 26]),
                 crate::transfer::color(&self.foreground).unwrap_or([242, 242, 247]),

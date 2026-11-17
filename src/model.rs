@@ -185,6 +185,7 @@ pub fn island_size_value(value: u32) -> u32 {
 #[derive(Clone, Debug)]
 pub struct Settings {
     pub appearance:crate::appearance::Appearance,
+    pub monitor:crate::system_monitor::Settings,
     pub clipboard_excluded:Vec<String>,
     pub clipboard_images:bool,
     pub clipboard_limit:usize,
@@ -204,8 +205,14 @@ pub struct Settings {
     pub browser_minimal: bool,
     pub avoid_browsers: bool,
     pub avoid_apps: Vec<(String,String)>,
-    pub visible_pages: [bool; 8],
-    pub page_order: [usize; 8],
+    pub visible_pages: [bool; 10],
+    pub capsule_pages: [bool; 10],
+    pub agent_capsule: bool,
+    pub weather_city: String,
+    pub show_weather: bool,
+    pub weather_fahrenheit: bool,
+    pub weather_interval: u32,
+    pub page_order: [usize; 10],
     pub show_battery: bool,
     pub clock_12h: bool,
     pub clock_period: u8,
@@ -251,7 +258,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { appearance:Default::default(), clipboard_excluded:vec![], clipboard_images:true, clipboard_limit:100, display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: false, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true,true,false,true,true,true,true,true], page_order: [0,1,2,3,4,5,6,7], show_battery: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, dingtalk_notifications:false, live_api:false, live_api_port:17831, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true }
+        Self { agent_capsule:false, appearance:Default::default(), monitor:Default::default(), clipboard_excluded:vec![], clipboard_images:true, clipboard_limit:100, display_id: String::new(), skin: Skin::Classic, island_shape: IslandShape::Notch, glass_blur: true, island_size: 100, island_offset: 0, dock: Dock::Top, settings_theme: Default::default(), pet: false, minimal: false, browser_minimal: false, avoid_browsers: true, avoid_apps: Vec::new(), visible_pages: [true,true,false,true,true,true,true,true,true,true], capsule_pages:[true,true,false,false,false,false,true,false,true,false], weather_city:String::new(), show_weather:true, weather_fahrenheit:false, weather_interval:30, page_order: [0,1,2,3,4,5,6,7,8,9], show_battery: true, clock_12h: false, clock_period: 0, resident_order: Vec::new(), system_hud: true, bluetooth_notifications: true, read_notifications:false, wechat_notifications:false, dingtalk_notifications:false, live_api:false, live_api_port:17831, wechat_tray_open:false, qq_only:false, notification_preview:false, notifications: true, sound: false, lyrics_enabled:true, island_lyrics:false, lyric_delay_ms:-350, hide_fullscreen: true, focus_minutes: 25, rest_minutes: 5, water_minutes: 45, serving_ml: 250, water_start: 9, water_end: 22, mail_enabled: true, mail_sync_operations:false, mail_code: true, mail_code_hide_seconds:60, mail_interval: 120, mail_ics: 15, ignored_mail_events: Vec::new(), calendar_prompt: true, calendar_auto_sync: true, clipboard_history: true }
     }
 }
 
@@ -281,9 +288,15 @@ impl Settings {
 
     pub fn load() -> Self {
         let mut s = Self::default();
+        let mut show_weather_set=false;
+        let mut capsule_pages_set=false;
+        let mut agent_capsule_set=false;
+        let mut current_visible_pages_set=false;
         for (k, v) in read_kv(&config_dir().join("settings.txt")) {
             match k.as_str() {
+                "agent_capsule" => {s.agent_capsule=v=="1";agent_capsule_set=true;},
                 "settings_theme" => s.settings_theme=crate::settings_theme::SettingsTheme::parse(&v),
+                "monitor" => {s.monitor=serde_json::from_str(&v).unwrap_or_default();s.monitor.normalize();},
                 "display_id" => s.display_id = v,
                 "skin" => {
                     // 早期测试版把胶囊当作皮肤保存。
@@ -301,22 +314,32 @@ impl Settings {
                 "avoid_apps" => s.avoid_apps = serde_json::from_str(&v).unwrap_or_default(),
                 "resident_order" => {
                     let order:Vec<usize>=v.split(',').filter_map(|n|n.parse().ok()).collect();
-                    if crate::bar_layout::valid_order(&order){s.resident_order=order;}
+                    if crate::bar_layout::valid_order(&order){s.resident_order=crate::bar_layout::complete_order(&order);}
                 }
                 "page_order" => {
                     if let Ok(order)=v.split(',').map(str::parse::<usize>).collect::<Result<Vec<_>,_>>() {
-                        if order.len()==8 && (0..8).all(|page|order.contains(&page)) {
-                            s.page_order.copy_from_slice(&order);
+                        if (8..=10).contains(&order.len()) && (0..order.len()).all(|page|order.contains(&page)) {
+                            for (dst,value) in s.page_order.iter_mut().zip(order) {*dst=value;}
                         }
                     }
                 }
                 "clock_period" => s.clock_period = v.parse::<u8>().ok().filter(|v|*v<=2).unwrap_or(0),
                 "clock_12h" => s.clock_12h = v == "1",
                 "show_battery" => s.show_battery = v != "0",
-                "visible_pages" if (6..=8).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
+                "visible_pages" if (6..=10).contains(&v.len()) && v.bytes().all(|b| b==b'0' || b==b'1') => {
+                    current_visible_pages_set=v.len()>=9;
                     for (enabled,value) in s.visible_pages.iter_mut().zip(v.bytes()) { *enabled=value==b'1'; }
-                    for enabled in &mut s.visible_pages[v.len()..]{*enabled=v.bytes().any(|b|b==b'1');}
+                    let has_active_page=v.bytes().enumerate().any(|(index,value)|index!=2 && value==b'1');
+                    for enabled in &mut s.visible_pages[v.len()..]{*enabled=has_active_page;}
                 }
+                "capsule_pages" if (9..=10).contains(&v.len()) && v.bytes().all(|b|b==b'0' || b==b'1') => {
+                    for (enabled,value) in s.capsule_pages.iter_mut().zip(v.bytes()) {*enabled=value==b'1';}
+                    capsule_pages_set=true;
+                },
+                "weather_city" => s.weather_city=serde_json::from_str(&v).unwrap_or_default(),
+                "show_weather" => {s.show_weather=v!="0";show_weather_set=true;},
+                "weather_fahrenheit" => s.weather_fahrenheit=v=="1",
+                "weather_interval" => s.weather_interval=match v.parse::<u32>().unwrap_or(30) {15=>15,60=>60,_=>30},
                 "read_notifications" => s.read_notifications=v=="1",
                 "wechat_notifications" => s.wechat_notifications=v=="1",
                 "dingtalk_notifications" => s.dingtalk_notifications=v=="1",
@@ -352,12 +375,18 @@ impl Settings {
                 _ => {}
             }
         }
+        if !show_weather_set {s.show_weather=if capsule_pages_set{s.capsule_pages[8]}else{s.visible_pages[8]};}
+        s.capsule_pages[8]=s.show_weather;
+        if !capsule_pages_set {s.capsule_pages[6]=s.visible_pages[6];}
+        if !agent_capsule_set && capsule_pages_set {s.agent_capsule=s.capsule_pages[6];}
         s.pet=false;s.visible_pages[2]=false;
-        if !s.visible_pages.contains(&true) { s.visible_pages[0]=true; }
+        if !s.visible_pages.contains(&true) && !current_visible_pages_set { s.visible_pages[0]=true; }
         s
     }
 
     pub fn save(&self) {
+        let mut capsule_pages=self.capsule_pages;
+        capsule_pages[8]=self.show_weather;
         let _ = write_kv(
             &config_dir().join("settings.txt"),
             &[
@@ -369,10 +398,17 @@ impl Settings {
                 ("island_size".into(),island_size_value(self.island_size).to_string()),
                 ("island_offset".into(),self.island_offset.clamp(-ISLAND_OFFSET_MAX,ISLAND_OFFSET_MAX).to_string()),
                 ("settings_theme".into(),self.settings_theme.key().into()),
+                ("monitor".into(),serde_json::to_string(&self.monitor).unwrap_or_default()),
                 ("minimal".into(), if self.minimal { "1".to_string() } else { "0".to_string() }),
                 ("browser_minimal".into(), (self.browser_minimal as u8).to_string()),
                 ("avoid_browsers".into(), (self.avoid_browsers as u8).to_string()),
                 ("avoid_apps".into(), serde_json::to_string(&self.avoid_apps).unwrap_or_default()),
+                ("capsule_pages".into(),capsule_pages.iter().map(|enabled|if *enabled {'1'}else{'0'}).collect()),
+                ("agent_capsule".into(),(self.agent_capsule as u8).to_string()),
+                ("weather_city".into(), serde_json::to_string(&self.weather_city).unwrap_or_default()),
+                ("show_weather".into(), (self.show_weather as u8).to_string()),
+                ("weather_fahrenheit".into(), (self.weather_fahrenheit as u8).to_string()),
+                ("weather_interval".into(), self.weather_interval.to_string()),
                 ("visible_pages".into(), self.visible_pages.iter().map(|enabled|if *enabled {'1'}else{'0'}).collect()),
                 ("page_order".into(),self.page_order.iter().map(usize::to_string).collect::<Vec<_>>().join(",")),
                 ("resident_order".into(),self.resident_order.iter().map(usize::to_string).collect::<Vec<_>>().join(",")),

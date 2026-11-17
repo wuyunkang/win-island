@@ -10,6 +10,7 @@ fn legacy_material_and_removed_feature_settings_are_retired() {
         let settings = Settings::load();
         assert!(!settings.pet);
         assert!(!settings.visible_pages[2]);assert!(settings.visible_pages[0]);
+        assert!(!settings.visible_pages[8], "仅启用已移除功能的旧设置不能意外开启天气页");
         settings.save();
         let saved = std::fs::read_to_string(path.join("settings.txt")).unwrap();
         assert!(!saved.contains("material="));

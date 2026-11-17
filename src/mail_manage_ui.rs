@@ -120,11 +120,23 @@ impl App{
     pub(crate) fn mail_locally_removed(&self,item:&Item)->bool{
         !self.settings.mail_sync_operations&&self.mail_local_key(item).and_then(|k|self.mail.manage.local.get(&k)).is_some_and(|f|f.removed)
     }
-    pub(crate) fn mail_manage_tick(&mut self){
-        if !self.mail.manage.local_loaded{
-            if !cfg!(test){self.mail_reload_local();}
+    fn mail_initialize_local(&mut self) {
+        if !self.mail.manage.local_loaded {
+            if !cfg!(test) {self.mail_reload_local();}
             self.mail.manage.local_loaded=true;
         }
+    }
+    /// 单独显示邮箱胶囊时也要刷新收件箱，不能读取当前打开的回收站。
+    pub(crate) fn mail_capsule_tick(&mut self) {
+        if !self.settings.mail_enabled || !self.mail.accounts.iter().any(|account|account.enabled) {return;}
+        self.mail_initialize_local();
+        if self.mail.manage.pending.is_empty() && self.t>=self.mail.manage.next_refresh {
+            self.mail.manage.next_refresh=self.t+60.0;
+            self.mail_manage_request(None,Folder::Inbox,Action::Load);
+        }
+    }
+    pub(crate) fn mail_manage_tick(&mut self){
+        self.mail_initialize_local();
         if !self.mail.manage.pending.is_empty(){return;}
         if let Some((email,uid))=self.mail.manage.auto_read.take(){
             let folder=self.mail.manage.folder();

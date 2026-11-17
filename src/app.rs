@@ -5,7 +5,7 @@
 
 use crate::extras::{Alert, PetState};
 use crate::anim::{self, lerp, smoothstep, Spring};
-use crate::bar_layout::{self as bar, Layout};
+use crate::bar_layout as bar;
 use crate::calendar;
 use crate::glass;
 use crate::lyrics;
@@ -53,7 +53,7 @@ fn pill_shadow(painter:&egui::Painter,rect:Rect,radius:f32,strength:f32){
         painter.rect_filled(r,radius+grow*0.8,Color32::from_black_alpha((255.0*a*strength) as u8));
     }
 }
-pub(crate) const PAGE_NAMES: [&str; 8] = ["音乐", "专注", "饮水", "剪贴板", "待办", "邮箱", "AI 额度", "日程"];
+pub(crate) const PAGE_NAMES: [&str; 10] = ["音乐", "专注", "饮水", "剪贴板", "待办", "邮箱", "AI", "日程", "天气", "系统监控"];
 
 // ---------- 动效参数 ----------
 /// 悬停意图缓冲：光标停留这么久才真正展开（期间药丸轻微胀大作为反馈），防误触。
@@ -175,6 +175,8 @@ pub enum Cmd {
     QuotaRefresh,
     QuotaConnected,
     QuotaChooseFile,
+    AgentReturn(crate::agent_sessions::Source),
+    AgentChooseDirectory,
     /// 把系统主音量设为 0..100（v0.5.4 音量条）。
     SetVolume(u32),
     /// 切换系统静音。
@@ -594,7 +596,10 @@ impl CalendarState {
 }
 
 pub struct App {
+    pub(crate) monitor:crate::system_monitor::State,
+    pub(crate) weather: crate::weather::State,
     pub(crate) transfer_ui:crate::transfer_ui::TransferUi,
+    pub(crate) preview_transfer_ui:crate::transfer_ui::TransferUi,
     pub opts: Options,
     pub settings: model::Settings,
     pub(crate) todos: model::TodoList,
@@ -617,7 +622,7 @@ pub struct App {
     page_dir: f32,
     page_t0: f64,
     slide: Spring,
-    dots: [Spring; 8],
+    dots: [Spring; PAGE_NAMES.len()],
     wheel_delta: f32,
     wheel_at: f64,
     wheel_page_at: f64,
@@ -676,6 +681,7 @@ pub struct App {
 
     forced_open_until:f64,
     pub settings_open:bool,
+    settings_resources_active:bool,
     pub displays:Vec<crate::display_layout::Display>,
     browser_at_top:bool,
     browser_minimal_active:bool,
@@ -741,6 +747,7 @@ pub struct App {
     /// v0.5.6：日历（CalDAV）配置、未来 24 小时事件与设置表单。
     pub(crate) calendar: CalendarState,
     pub(crate) quota: crate::quota_ui::State,
+    pub(crate) ai: crate::ai_ui::State,
     pub(crate) updates: crate::updates::State,
     pub(crate) resident: bar::Motion,
     pub(crate) resident_power: (Option<u8>,bool),
@@ -765,8 +772,10 @@ impl App {
         let initial_lyrics=settings.lyrics_enabled;
         let initial_page=settings.page_order.iter().copied().find(|page|settings.visible_pages[*page]).unwrap_or(0);
         Self {
+            monitor:Default::default(), weather:Default::default(),
             opts,
             transfer_ui:Default::default(),
+            preview_transfer_ui:Default::default(),
             settings,
             todos: model::TodoList::load(),
             water: model::Water::default(),
@@ -824,7 +833,7 @@ impl App {
             media_anchor: (String::new(), 0.0, 0.0, false),
             media: NowPlaying::default(),
             music_artwork: None,
-            forced_open_until:0.0, settings_open:false, displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, wechat_status:String::new(), dingtalk_status:String::new(), live_api_status:String::new(), activities:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
+            forced_open_until:0.0, settings_open:false, settings_resources_active:false, displays:Vec::new(), browser_at_top:false, browser_minimal_active:false, glass_tint:0.0, fluid:Default::default(), fluid_origin:Pos2::ZERO, fluid_art:None, fluid_title:String::new(), screen:None, settings_focus_requested:false, settings_tab:0, settings_category:0, wechat_status:String::new(), dingtalk_status:String::new(), live_api_status:String::new(), activities:Default::default(), notification_apps:model::NotificationApps::load(), subpage:None, task_dialog:None,
             listener_status: "尚未连接".into(),
             notification_bell_until: 0.0, notification_bell_at: -10.0, notice: None, hud_notice: None, hud_alpha: 0.0, notice_width:Spring::new(0.0,CLOSE.0,CLOSE.1), notice_details:false, pending_messengers:Vec::new(), messenger_scroll:0.0, alerts: Default::default(), history: Default::default(), pending: vec![],
             todo_first: 0, todo_choosing: false, pet: Default::default(), last_drink: None,
@@ -846,6 +855,7 @@ impl App {
             mail: MailState { accounts: mail::load_accounts(), ..Default::default() },
             calendar: CalendarState::load(),
             quota: crate::quota_ui::State::load(),
+            ai: crate::ai_ui::State::load(),
             updates: Default::default(),
             resident: Default::default(), resident_power:(None,false),
         }
@@ -1293,7 +1303,7 @@ impl App {
     pub fn show_page(&mut self,page:usize) {
         if page==2 || page>=PAGE_NAMES.len(){return;}
         if !self.settings.visible_pages[page] {
-            self.settings_tab=[1,2,3,5,4,7,11,8][page];
+            self.settings_tab=[1,2,3,5,4,7,11,8,12,13][page];
             self.open_settings();
             return;
         }
@@ -1317,14 +1327,36 @@ impl App {
     pub fn page(&self) -> usize {
         self.page
     }
+    pub(crate) fn expanded_page_visible(&self,page:usize)->bool {
+        self.settings.visible_pages.get(page)==Some(&true) && (self.open||self.progress()>0.01)
+            && (self.page==page||(self.page_from==page&&self.page_e()<0.16))
+    }
+    pub(crate) fn release_hidden_resources(&mut self,ctx:&egui::Context){
+        if self.agent_demand(true)!=Some(true){self.ai.release_body();}
+        if !self.expanded_page_visible(3){self.transfer_ui.release_resources();self.icons.clear();}
+        if !self.settings_preview_needed(3){self.preview_transfer_ui.release_resources();}
+        if !self.music_artwork_needed(){self.music_artwork=None;self.media.artwork=None;}
+        if !self.music_polling_needed(){self.ly=LyricsState::default();self.island_lyric_layout=None;}
+        else if !self.music_lyrics_needed(){
+            self.ly.rx=None;self.ly.native_rx=None;self.ly.loading=false;self.ly.retry_at=None;
+            if self.ly.lyrics.is_none(){self.ly.key.clear();}
+            self.island_lyric_layout=None;
+        }
+        if self.settings_resources_active&&!self.settings_open{ctx.forget_all_images();}
+        self.settings_resources_active=self.settings_open;
+    }
 
     pub(crate) fn set_page_visible(&mut self,page:usize,visible:bool) {
         if page==2 || page>=PAGE_NAMES.len(){return;}
-        if !visible && self.settings.visible_pages.iter().filter(|enabled|**enabled).count()==1
-            && self.settings.visible_pages[page] { return; }
+        let had_pages=self.settings.visible_pages.iter().any(|enabled|*enabled);
         self.settings.visible_pages[page]=visible;
+        if visible && !had_pages && page==self.page {
+            self.page_t0=self.t-1.0;self.dots_target();
+            if page==CALENDAR_PAGE {self.request_calendar_month(false);}
+        }
         if !self.settings.visible_pages[self.page] {
             if let Some(first)=self.settings.page_order.iter().copied().find(|page|self.settings.visible_pages[*page]) { self.go(first,1.0); }
+            else {self.cancel_edit();self.subpage=None;}
         }
     }
 
@@ -1405,9 +1437,9 @@ impl App {
         self.todo_ime_frame=false;
     }
 
-    fn island_lyrics_active(&self)->bool {
+    pub(crate) fn island_lyrics_active(&self)->bool {
         if self.side() {return false;}
-        self.settings.island_lyrics && self.settings.visible_pages[0] && self.media.is_music()
+        self.settings.island_lyrics && self.capsule_enabled(0) && self.media.is_music()
             && !self.browser_minimal_active
     }
     pub(crate) fn compact_notices(&self)->bool {self.island_lyrics_active()&&!self.open&&!self.notice.as_ref().is_some_and(|a|a.meeting.is_some()||matches!(a.source,crate::extras::AlertSource::Activity(_))||self.settings.notification_preview&&matches!(a.source,crate::extras::AlertSource::External(_)))}
@@ -1422,6 +1454,10 @@ impl App {
         let index=lyrics.index_at(self.lyric_position())?;
         let text=lyrics.lines.get(index)?.text.trim();
         (!text.is_empty()).then_some((index,text))
+    }
+
+    pub(crate) fn island_lyric_display_text(&self)->&str {
+        self.island_lyric_layout.as_ref().map(|galley|galley.text()).unwrap_or(self.media.title.trim())
     }
 
     fn update_island_lyric_layout(&mut self,ctx:&egui::Context) {
@@ -1462,8 +1498,8 @@ impl App {
     pub(crate) fn effective_minimal(&self)->bool {self.settings.minimal || self.browser_minimal_active}
     pub(crate) fn pet_enabled(&self)->bool {self.settings.pet && !self.effective_minimal() && !self.side()}
     pub(crate) fn pet_space(&self)->f32 {if self.pet_enabled(){44.0}else{0.0}}
-    fn lyric_focus_space(&self)->f32 {if self.pomo.running{crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
-    fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
+    pub(crate) fn lyric_focus_space(&self)->f32 {if self.pomo.running && self.capsule_enabled(1){crate::focus_bar::LYRIC_WIDTH+10.0}else{0.0}}
+    pub(crate) fn lyric_bar_width(&self)->f32 {LYRIC_BAR_W+if self.pet_enabled(){48.0}else{0.0}+self.lyric_focus_space()}
     fn notice_size(&self,a:&Alert)->(f32,f32) {
         let (width,height)=if matches!(a.source,crate::extras::AlertSource::Activity(_)){(334.0,52.0)}else if a.meeting.is_some(){(360.0,136.0)}else if a.source==crate::extras::AlertSource::Internal && a.title=="蓝牙设备"{(HUD_W,48.0)}else if a.is_hud(){(HUD_W,38.0)}else{(334.0,44.0)};
         (width,height)
@@ -1548,6 +1584,7 @@ impl App {
         let mut cmds = Vec::new();
 
         self.tick(env, dt, elapsed);
+        if self.capsule_enabled(5) && !(self.open && self.page==5) {self.mail_capsule_tick();}
         self.sync_device(env);
         self.tick_alerts();
         let hud_active=self.notice.clone();
@@ -1559,10 +1596,11 @@ impl App {
         self.notice_width.target=notice_target;
         if self.compact_notices(){self.notice_width.step(dt);}else{self.notice_width.snap(0.0);self.notice_details=false;}
         self.update_media(env,&ctx);
-        let bell=self.t<self.notification_bell_until&&!self.compact_notices();
         self.resident_power=(env.battery,env.charging);
-        let mut layout=Layout::new(self.settings.show_battery&&env.battery.is_some(),self.quota_bar_indices().len(),self.media.is_music()&&!bell,self.pomo.running,bell,self.pet_enabled());
-        layout.reorder(&self.settings.resident_order);
+        self.monitor_tick(&ctx);
+        if self.weather_polling_needed(){self.weather.update(&self.settings.weather_city,self.settings.weather_interval,&ctx);}else{self.weather.release();}
+        self.release_hidden_resources(&ctx);
+        let mut layout=self.capsule_layout_for_preview();
         for (position,extra) in self.quota_balance_layout(&ctx){layout.balance_tail(position,extra);}
         if self.settings.clock_period!=0 { layout.widen_clock(40.0); }
         if self.pet_enabled() {
@@ -1615,7 +1653,8 @@ impl App {
                 let cursor=env.cursor.unwrap()-self.content_origin(win).to_vec2()-Vec2::new(CONTENT_X,0.0);
                 let mail_reading=self.page==5 && self.mail.open_uid.is_some();
                 let mail_list=self.page==5 && !self.mail.accounts.is_empty() && self.mail.open_uid.is_none() && self.mail_list_bounds().contains(cursor);
-                if mail_reading || mail_list {self.wheel_delta=0.0;}
+                let ai_reading=self.page==6&&!self.ai.config.quota_tab&&Rect::from_min_max(Pos2::new(12.,32.),Pos2::new(CONTENT_W-12.,201.)).contains(cursor);
+                if mail_reading || mail_list || ai_reading {self.wheel_delta=0.0;}
                 else {
                     // 累积高精度滚轮的小幅输入；停顿或反向时丢弃上一段余量。
                     if self.t-self.wheel_at>0.18 || self.wheel_delta*scroll<0.0 {self.wheel_delta=0.0;}
@@ -1884,8 +1923,8 @@ impl App {
             || self.hud_alpha > 0.003 && self.hud_alpha < 0.997
             || !self.notice_width.settled(1.0);
         let pet_visible=self.pet_a>0.01 && !self.open && !minimal_pill;
-        let ambient=self.settings.skin==model::Skin::Fluid && self.fluid.animating() || self.pomo.running && (self.open && self.page==1 || !self.open && !minimal_pill && self.notice.is_none() && bar::animations_enabled())
-            || self.media.playing && (self.open && self.page==0 || !self.open && !minimal_pill && self.notice.is_none() && self.media.is_music())
+        let ambient=self.settings.skin==model::Skin::Fluid && self.fluid.animating() || self.pomo.running && (self.open && self.page==1 || !self.open && self.capsule_enabled(1) && !minimal_pill && self.notice.is_none() && bar::animations_enabled())
+            || self.media.playing && (self.open && self.page==0 || !self.open && self.capsule_enabled(0) && !minimal_pill && self.notice.is_none() && self.media.is_music())
             || self.notice.as_ref().is_some_and(|notice|notice.meeting.is_some());
         let animating=transitioning || ambient || pet_visible && self.pet.state!=PetState::Sleeping;
         // 交互形变保持 60 帧，媒体 30 帧；小表情 20 帧，睡眠 10 帧，静态界面每秒核对提醒。
@@ -2091,9 +2130,11 @@ impl App {
 
     /// 设置页预览用的岛体底色：没有真实模糊，毛玻璃按较实的玻璃表现。
     pub(crate) fn preview_fill(&self)->Color32 {
+        if self.settings.appearance.theme!=crate::appearance::PanelTheme::Dark{return self.glass_fill();}
+        let opacity=1.0-self.settings.appearance.transparency as f32/100.0;
         match self.settings.skin {
-            model::Skin::GlassDark=>{let (r,g,b)=glass::GROUND_DARK;Color32::from_rgba_unmultiplied(r,g,b,215)}
-            model::Skin::GlassLight=>{let [r,g,b]=glass::LIGHT_GROUND.map(|v|(v*255.0).round() as u8);Color32::from_rgba_unmultiplied(r,g,b,225)}
+            model::Skin::GlassDark=>{let (r,g,b)=glass::GROUND_DARK;Color32::from_rgba_unmultiplied(r,g,b,(215.0*opacity)as u8)}
+            model::Skin::GlassLight=>{let [r,g,b]=glass::LIGHT_GROUND.map(|v|(v*255.0).round() as u8);Color32::from_rgba_unmultiplied(r,g,b,(225.0*opacity)as u8)}
             _=>self.glass_fill(),
         }
     }
@@ -2277,7 +2318,7 @@ impl App {
             let position=c.pos(left+content_width-LYRIC_BAR_W/2.0,center_y-galley.size().y/2.0+(1.0-fade)*3.0);
             c.painter.galley(position,galley,if lyric.is_some(){theme::WHITE}else{theme::GRAY});
             paint::playback_bars(&c,left+content_width-21.0,center_y,self.t,self.media.playing,theme::WHITE);
-            if self.pomo.running {
+            if self.pomo.running && self.capsule_enabled(1) {
                 let alpha=smoothstep(0.88,1.0,(width-content_width)/self.lyric_focus_space());
                 crate::focus_bar::draw(&c.faded(alpha),left+width-14.0-crate::focus_bar::LYRIC_WIDTH/2.0,center_y,self.t,&self.pomo,self.phase_secs(self.pomo.phase),true);
             }
@@ -2326,7 +2367,7 @@ impl App {
         if reveal > 0.0 {
             base.faded(reveal).text(hd + (1.0 - reveal) * 10.0, 22.5, &env.date, size::DATE, W::Regular, Color32::from_rgb(210, 210, 214), H::Left);
         }
-        if has_music && (p>0.1 || layout.x[bar::MUSIC].is_some()) {
+        if has_music && (p>0.1 || (self.capsule_enabled(0) && layout.x[bar::MUSIC].is_some())) {
             paint::playback_bars(base,lerp(local_cx+layout.x[bar::MUSIC].unwrap_or(0.0),367.0,m),lerp(15.0,18.0,m),self.t,self.media.playing,theme::WHITE);
         }
         let compact_alpha=1.0-smoothstep(0.0,0.22,p);
@@ -2339,10 +2380,14 @@ impl App {
         }
         if compact_alpha>0.004 {
             let c=base.faded(compact_alpha);let c=if compact_alpha<0.8{c.ghost()}else{c};
-            self.draw_quota_bar(&c,local_cx,&layout);
+            self.draw_ai_bar(&c,local_cx,&layout);
+            if let Some(x)=layout.x[bar::WEATHER] {self.weather.draw_resident(&c,local_cx+x,self.settings.weather_fahrenheit);}
+            for page in [3,4,5,7,9] {
+                if let Some(x)=crate::feature_config::feature_slot(page).and_then(|slot|layout.x[slot]) {self.draw_capsule_feature(&c,page,local_cx+x,15.0,&env.today);}
+            }
         }
         if self.pomo.running && compact_alpha>0.004 {
-            crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+layout.x[bar::FOCUS].unwrap(),15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);
+            if let Some(x)=layout.x[bar::FOCUS] {crate::focus_bar::draw(&base.faded(compact_alpha),local_cx+x,15.0,self.t,&self.pomo,self.phase_secs(self.pomo.phase),false);}
         }
     }
 
@@ -2389,12 +2434,18 @@ impl App {
     fn panel_body(&mut self, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) {
         self.feature_tabs(c);
         let gear_x=self.expanded_width()-25.0;
-        let settings=c.hit(gear_x-14.0,4.0,28.0,28.0,"page-settings").on_hover_text(format!("打开{}设置窗口",PAGE_NAMES[self.page]));
+        let no_pages=!self.settings.visible_pages.iter().any(|visible|*visible);
+        let settings=c.hit(gear_x-14.0,4.0,28.0,28.0,"page-settings").on_hover_text(if no_pages {"打开页面管理".to_owned()}else{format!("打开{}设置窗口",PAGE_NAMES[self.page])});
         let (hover,press)=c.hover_t(&settings);
         c.circle(gear_x,18.0,13.0,Color32::from_white_alpha((hover*24.0) as u8));
         paint::gear(&c.scaled(gear_x,18.0,0.8*(1.0-press*0.08)),gear_x,18.0,paint::mix(theme::GRAY,theme::WHITE,hover));
-        if settings.clicked(){self.settings_tab=[1,2,3,5,4,7,11,8][self.page];self.open_settings();}
+        if settings.clicked(){self.settings_tab=if no_pages {10}else{[1,2,3,5,4,7,11,8,12,13][self.page]};self.open_settings();}
         let content=c.shifted(CONTENT_X,0.0).clipped(0.0,0.0,CONTENT_W,self.expanded_height());let c=&content;
+        if no_pages {
+            c.centered_text(CONTENT_W/2.0,105.0,"尚未开启展开页",14.0,W::Semibold,theme::GRAY,H::Center);
+            c.centered_text(CONTENT_W/2.0,130.0,"点击右上角设置，在页面管理中开启",11.0,W::Regular,theme::DIM,H::Center);
+            return;
+        }
         if self.subpage==Some(self.page) {
             c.text(15.0,25.0,"‹",19.0,W::Bold,theme::WHITE,H::Left);
             c.text(37.0,25.0,if self.page==2{"饮水设置"}else{"专注设置"},size::TITLE,W::Bold,theme::WHITE,H::Left);
@@ -2408,7 +2459,7 @@ impl App {
             let old_a = 1.0 - smoothstep(0.0, 0.16, e);
             let new_a = smoothstep(0.03, 0.28, e);
             let old_dx = -self.page_dir * 18.0 * anim::ease_out_cubic(e / 0.3);
-            if old_a > 0.0 {
+            if old_a > 0.0 && self.settings.visible_pages[self.page_from] {
                 let oc = c.faded(old_a).ghost();
                 self.page_title(self.page_from, &oc);
                 self.render_page(self.page_from, &oc.shifted(old_dx, 0.0), env, &mut Vec::new());
@@ -2425,17 +2476,17 @@ impl App {
         self.nav(c);
     }
 
-    fn page_title(&self, page: usize, c: &Card) {
+    pub(crate) fn page_title(&self, page: usize, c: &Card) {
         let base = 25.0;
         let (a, b, col) = match page {
-            0 | CALENDAR_PAGE => return,
+            0 | CALENDAR_PAGE | 8 | 9 => return,
             1 => ("番茄", "专注", theme::RED_TOP),
             2 => ("饮水", "提醒", theme::BLUE),
             // 置物架的标题就是「置物架 | 剪贴板」分栏，由页面自己画。
             3 => return,
             4 => ("待办", "清单", theme::GREEN),
             5 => ("邮箱", "", theme::CYAN),
-            6 => ("AI", "额度", theme::SOFT_GREEN),
+            6 => ("AI", "", theme::SOFT_GREEN),
             _ => ("灵动岛", "设置", theme::WHITE),
         };
         let wa = c.text(15.0, base, a, size::TITLE, W::Bold, theme::WHITE, H::Left);
@@ -2444,7 +2495,7 @@ impl App {
         }
     }
 
-    fn nav(&mut self, c: &Card) {
+    pub(crate) fn nav(&mut self, c: &Card) {
         if self.page==3{return;}
         let pages: Vec<_>=self.settings.page_order.iter().copied().filter(|page|self.settings.visible_pages[*page]).collect();
         if pages.len()<2 { return; }
@@ -2486,7 +2537,7 @@ impl App {
         }
     }
 
-    fn render_page(&mut self, page: usize, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) {
+    pub(crate) fn render_page(&mut self, page: usize, c: &Card, env: &Env, cmds: &mut Vec<Cmd>) {
         match page {
             0 => self.page_music(c, env, cmds),
             1 => self.page_focus(c, env),
@@ -2494,8 +2545,10 @@ impl App {
             3 => self.transfer_page(c, cmds),
             4 => self.page_todo(c, env, cmds),
             5 => self.page_mail(c, env, cmds),
-            6 => self.page_quota(c),
+            6 => self.page_ai(c),
             CALENDAR_PAGE => self.page_calendar(c,env),
+            8 => self.page_weather(c),
+            9 => self.page_monitor(c),
             _ => self.page_settings(c),
         }
     }
@@ -2631,7 +2684,7 @@ impl App {
         let other_song=matches!((self.media.song_id,np.song_id),(Some(old),Some(new)) if old!=new);
         if self.media.source != np.source || other_song { self.ly=LyricsState::default(); }
         self.media = np;
-        if let Some(image)=&self.media.artwork {
+        if let Some(image)=self.media.artwork.as_ref().filter(|_|self.music_artwork_needed()) {
             if !self.music_artwork.as_ref().is_some_and(|(old,_)|std::sync::Arc::ptr_eq(old,image)) {
                 self.music_artwork=Some((image.clone(),ctx.load_texture("music-artwork",image.clone(),egui::TextureOptions::LINEAR)));
             }
@@ -2640,7 +2693,7 @@ impl App {
 
     fn poll_lyrics(&mut self) {
         if !self.media.is_music(){self.ly=LyricsState::default();return;}
-        if !self.show_lyrics && !self.settings.island_lyrics {self.ly=LyricsState::default();return;}
+        if !self.music_lyrics_needed() {return;}
         let np = &self.media;
         if np.title.is_empty(){self.ly=LyricsState::default();return;}
         let key = format!("{}|{}|{:.0}", np.title, np.artist, np.duration);

@@ -1,0 +1,10 @@
+{
+  "name": "win-island-dsh-bridge",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "灵动岛的 DSH 只读会话桥接，无独立界面或模型调用",
+  "main": "index.mjs",
+  "license": "MIT",
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "engines": { "node": ">=22.19.0" }
+}
