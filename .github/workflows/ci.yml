@@ -14,7 +14,13 @@ jobs:
       - name: 安装 Rust stable
         run: rustup toolchain install stable --profile minimal
       - name: 验证 HTTP 代理请求格式
-        run: cargo +stable test --locked --manifest-path vendor/ureq/Cargo.toml --lib --no-default-features --features tls,gzip --target x86_64-pc-windows-msvc unit::tests
+        shell: pwsh
+        run: |
+          # 第三方库不是主工作区成员，独立复制后运行其自身测试和开发依赖。
+          $ureqTests = Join-Path $env:RUNNER_TEMP 'win-island-ureq-tests'
+          Copy-Item -LiteralPath vendor/ureq -Destination $ureqTests -Recurse
+          cargo +stable test --manifest-path (Join-Path $ureqTests 'Cargo.toml') --lib --no-default-features --features tls,gzip --target x86_64-pc-windows-msvc unit::tests
+          if ($LASTEXITCODE -ne 0) { throw 'HTTP 代理回归失败' }
       - name: 测试
         run: cargo +stable test --locked --workspace --all-targets --features record --target x86_64-pc-windows-msvc -- --test-threads=1
       - name: 检查安装脚本语法
