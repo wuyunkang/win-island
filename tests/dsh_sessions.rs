@@ -21,6 +21,14 @@ fn dsh_public_snapshot_is_namespaced_and_waiting_is_an_active_state() {
 }
 
 #[test]
+fn dsh_tagged_subagent_snapshot_is_ignored_before_rendering() {
+    let raw = json!({"id":"child","subagent":true,"state":"completed","updatedAt":1700000000123i64});
+    for full in [false, true] {
+        assert!(dsh::parse_snapshot(&raw, full).is_err());
+    }
+}
+
+#[test]
 fn dsh_reader_bounds_body_and_does_not_invent_unknown_metrics() {
     let messages = (0..100)
         .map(|_| json!({"kind":"progress","text":"正文".repeat(10000)}))

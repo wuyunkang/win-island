@@ -146,6 +146,39 @@ fn agent_notifications_handle_inventory_gaps_and_share_the_messenger_queue() {
     assert!(h.app.notice.is_none(),"子 Agent 不单独弹出询问");
 }
 #[test]
+fn agent_subagent_completion_leaves_no_banner_badge_or_completion_check() {
+    use crate::agent_sessions::{AgentState, Source, Update};
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for source in [Source::Codex, Source::Dsh] {
+        let mut h = H::new();
+        h.app.settings.agent_capsule = true;
+        h.app.settings.notifications = true;
+        let mut parent = agent_capsule_sample(source, AgentState::Working, "parent", "主项目");
+        let mut child = agent_capsule_sample(source, AgentState::Working, "child", "子项目");
+        child.subagent = true;
+        h.app.ai.receive(Update { recent: vec![parent.clone(), child.clone()], ..Default::default() }, h.t);
+
+        child.state = AgentState::Completed;
+        child.activity_ms += 100;
+        h.app.ai.receive(Update { recent: vec![parent.clone(), child], ..Default::default() }, h.t);
+        h.frame(vec![]);
+        assert!(h.app.notice.is_none());
+        assert!(h.app.alerts.is_empty());
+        assert!(h.app.pending_agents.is_empty());
+        assert!(!agent_capsule_has_completion(&agent_capsule_output(&mut h, false, vec![])));
+
+        parent.state = AgentState::Completed;
+        parent.activity_ms += 200;
+        h.app.ai.receive(Update { recent: vec![parent], ..Default::default() }, h.t);
+        h.frame(vec![]);
+        assert_eq!(h.app.pending_agents.len(), 1);
+        assert_eq!(h.app.pending_agents[0].id, "parent");
+        assert!(h.app.notice.as_ref().is_some_and(|notice| notice.title.contains("任务完成")));
+        assert!(agent_capsule_has_completion(&agent_capsule_output(&mut h, false, vec![])));
+    }
+}
+
+#[test]
 fn agent_notifications_keep_a_right_badge_after_the_popup_until_viewed() {
     use crate::agent_sessions::{AgentState,Source,Update};
     let _g=ENV_LOCK.lock().unwrap_or_else(|e|e.into_inner());

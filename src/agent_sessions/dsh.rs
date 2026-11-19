@@ -27,6 +27,9 @@ fn valid_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c))
 }
 pub fn parse_snapshot(raw: &Value, full: bool) -> Result<Snapshot, String> {
+    if raw["subagent"].as_bool() == Some(true) {
+        return Err("忽略 DSH 子代理会话".into());
+    }
     let id = raw["id"]
         .as_str()
         .filter(|id| valid_id(id))

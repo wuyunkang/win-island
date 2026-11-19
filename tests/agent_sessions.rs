@@ -244,6 +244,37 @@ fn record(at: i64, payload: serde_json::Value) -> String {
 }
 
 #[test]
+fn agent_reader_excludes_subagents_in_either_metadata_field() {
+    let fixture = Fixture::new("subagent-metadata");
+    let parent = fixture.write("parent", 100);
+    let mut request = fixture.request(true);
+    let mut reader = island::agent_sessions::Reader::new(fixture.root.clone());
+    for (index, (source, thread_source)) in [
+        (json!("vscode"), json!("subagent")),
+        (json!("subagent"), json!("user")),
+        (json!({"subagent":{"thread_spawn":{}}}), json!("subagent")),
+        (json!("vscode"), json!({"subagent":{"thread_spawn":{}}})),
+    ].into_iter().enumerate() {
+        let id = format!("child-{index}");
+        let path = fixture.path(&id);
+        let meta = json!({"type":"session_meta","payload":{"id":id,"source":source,"thread_source":thread_source}});
+        std::fs::write(&path, format!("{meta}\n{}", record(200, json!({"type":"task_started","turn_id":"child-turn"})))).unwrap();
+        let running = reader.poll(&request);
+        assert_eq!(running.latest.as_ref(), Some(&parent), "子代理开始执行时不能抢占主会话");
+        assert_eq!(running.recent.len(), 1);
+
+        append(&path, record(201, json!({"type":"task_complete","turn_id":"child-turn"})).as_bytes());
+        let finished = reader.poll(&request);
+        assert_eq!(finished.latest.as_ref(), Some(&parent));
+        assert_eq!(finished.recent.len(), 1);
+
+        request.pinned = Some(path);
+        assert!(reader.poll(&request).selected.is_none(), "旧配置固定的子代理也不能选中");
+        request.pinned = None;
+    }
+}
+
+#[test]
 fn agent_reader_uses_semantic_activity_retries_utf8_partial_and_releases_body() {
     let f = Fixture::new("incremental");
     let a = f.write("a", 100);

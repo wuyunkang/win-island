@@ -448,9 +448,9 @@ impl Parser {
                     .next()
                     .unwrap_or("")
                     .to_owned();
-                self.data.subagent = p["source"].get("subagent").is_some()
-                    || p["thread_source"].get("subagent").is_some()
-                    || str_at(p, "source") == "subagent";
+                self.data.subagent = [&p["source"], &p["thread_source"]]
+                    .into_iter()
+                    .any(|source| source.as_str() == Some("subagent") || source.get("subagent").is_some());
             }
             "turn_context" => {
                 if let Some(model) = p["model"].as_str() {

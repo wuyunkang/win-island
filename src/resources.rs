@@ -105,6 +105,16 @@ pub fn snapshot()->Option<Snapshot>{
 #[cfg(not(windows))]
 pub fn snapshot()->Option<Snapshot>{None}
 
+#[cfg(windows)]
+pub(crate) fn available_commit_bytes() -> Option<usize> {
+    use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
+
+    let size = std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32;
+    let mut info = PERFORMANCE_INFORMATION { cb: size, ..Default::default() };
+    unsafe { GetPerformanceInfo(&mut info, size) }.ok()?;
+    Some(info.CommitLimit.saturating_sub(info.CommitTotal).saturating_mul(info.PageSize))
+}
+
 const LOG_LIMIT:u64=512*1024;
 fn append(directory:&Path,line:&str)->std::io::Result<()> {append_rotating(directory,"resources",LOG_LIMIT,line)}
 
@@ -135,6 +145,10 @@ fn record(value:Snapshot)->String {
     let mut line=format!("time={now} build={} pid={} private={} working={} handles={} threads={} abnormal={} timeouts={} rejected_data={} control_dropped={} textures={} texture_bytes={} galleys={}",
         option_env!("DAOZAI_BUILD_LABEL").or(option_env!("CARGO_PKG_VERSION")).unwrap_or("test"),std::process::id(),value.private_bytes,value.working_bytes,value.handles,value.threads,value.abnormal(),
         TIMEOUTS.load(Ordering::Relaxed),REJECTED_DATA.load(Ordering::Relaxed),CONTROL_DROPPED.load(Ordering::Relaxed),TEXTURES.load(Ordering::Relaxed),TEXTURE_BYTES.load(Ordering::Relaxed),GALLEYS.load(Ordering::Relaxed));
+    #[cfg(windows)]
+    if let Some(bytes) = available_commit_bytes() {
+        let _ = write!(line, " commit_available_bytes={bytes}");
+    }
     for lane in [&POLLER,&ARTWORK,&COVER,&LYRICS,&NATIVE_LYRICS,&CONTROL,&ASYNC,&ASYNC_ARTWORK,&MONITOR,&SYSTEM_MONITOR,&WEATHER,&AGENT_SESSION] {
         let _=write!(line," {}={}/{}/{}/{}",lane.name,lane.active(),lane.limit,lane.started.load(Ordering::Relaxed),lane.denied.load(Ordering::Relaxed));
     }

@@ -116,6 +116,30 @@ mod win {
         let Ok(handle)=GetClipboardData(format)else{return String::new();};let memory=HGLOBAL(handle.0);let pointer=GlobalLock(memory) as *const u8;
         if pointer.is_null(){return String::new();}let size=GlobalSize(memory).min(2*1024*1024);let bytes=std::slice::from_raw_parts(pointer,size);let len=bytes.iter().position(|b|*b==0).unwrap_or(size);let text=String::from_utf8_lossy(&bytes[..len]).to_string();let _=GlobalUnlock(memory);text
     }
+    pub(super) fn capture_picture(
+        commit_available_bytes: Option<usize>,
+        read: impl FnOnce() -> Option<super::Picture>,
+    ) -> Option<super::Picture> {
+        // 解码后的 RGBA 可达约 61 MiB，同时还需要剪贴板数据、转换和 PNG 编码缓冲区。
+        const MIN_PICTURE_COMMIT_BYTES: usize = 256 * 1024 * 1024;
+        if commit_available_bytes.is_some_and(|bytes| bytes < MIN_PICTURE_COMMIT_BYTES) {
+            return None;
+        }
+        read()
+    }
+
+    fn read_picture() -> Option<super::Picture> {
+        let data = arboard::Clipboard::new().ok()?.get_image().ok()?;
+        if data.width.checked_mul(data.height)? > 16_000_000 {
+            return None;
+        }
+        let (width, height) = (data.width as u32, data.height as u32);
+        let buffer = image::RgbaImage::from_raw(width, height, data.bytes.into_owned())?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(buffer).write_to(&mut png, image::ImageFormat::Png).ok()?;
+        Some(super::Picture { width, height, png: std::sync::Arc::new(png.into_inner()) })
+    }
+
     pub(super) unsafe fn read_content(hwnd:HWND,shared:&Shared)->bool{
         let source=source_app();if !shared.allows_source(&source){return false;}
         if OpenClipboard(hwnd).is_err(){return false;}
@@ -128,14 +152,10 @@ mod win {
         }
         let image=IsClipboardFormatAvailable(windows::Win32::System::Ole::CF_DIB.0 as u32).is_ok()||IsClipboardFormatAvailable(windows::Win32::System::Ole::CF_DIBV5.0 as u32).is_ok();
         let html=registered_text("HTML Format");let rtf=registered_text("Rich Text Format");let _=CloseClipboard();
-        if image&&shared.options.lock().is_ok_and(|o|o.images){
-            if let Ok(mut clipboard)=arboard::Clipboard::new(){if let Ok(data)=clipboard.get_image(){
-                if data.width.checked_mul(data.height).is_some_and(|pixels|pixels<=16_000_000){
-                    if let Some(buffer)=image::RgbaImage::from_raw(data.width as u32,data.height as u32,data.bytes.into_owned()){
-                        let mut png=std::io::Cursor::new(Vec::new());if image::DynamicImage::ImageRgba8(buffer).write_to(&mut png,image::ImageFormat::Png).is_ok(){return shared.record_picture(super::Picture{width:data.width as u32,height:data.height as u32,png:std::sync::Arc::new(png.into_inner())},&source);}
-                    }
-                }
-            }}
+        if image && shared.options.lock().is_ok_and(|o| o.images) {
+            if let Some(picture) = capture_picture(crate::resources::available_commit_bytes(), read_picture) {
+                return shared.record_picture(picture, &source);
+            }
         }
         read_text(hwnd).is_some_and(|(text,from_history)|!from_history&&shared.record_source(&text,&source,&html,&rtf))
     }
@@ -163,6 +183,22 @@ mod win {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn clipboard_image_skips_allocation_during_system_commit_exhaustion() {
+        let picture = || Some(Picture { width: 1, height: 1, png: Arc::new(vec![1]) });
+        let available_at_incident = 65_985_994_752u64 - 65_885_302_784;
+        let attempted = std::cell::Cell::new(false);
+        let result = win::capture_picture(Some(available_at_incident as usize), || {
+            attempted.set(true);
+            picture()
+        });
+        assert!(!attempted.get(), "系统提交余量不足时不应进入图片解码或压缩");
+        assert!(result.is_none());
+        assert!(win::capture_picture(Some(1024 * 1024 * 1024), picture).is_some());
+        assert!(win::capture_picture(None, picture).is_some(), "系统查询失败时保持原有行为");
+    }
 
     #[test]
     #[cfg(windows)]
